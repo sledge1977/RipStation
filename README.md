@@ -1,6 +1,6 @@
-# Jens' Multi-Drive Ripping Station
+# Multi-Drive Ripping Station
 
-This Python script manages multiple DVD drives to rip movies efficiently in parallel. It provides an interactive command-line interface to control ripping and performs automatic post-processing. Blu-ray discs and TV series support are planned for later.
+This Python script manages multiple drives to rip movies efficiently in parallel. It provides an interactive command-line interface to control ripping and performs automatic post-processing. Blu-ray discs and TV series support are planned for later.
 
 ## Features
 
