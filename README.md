@@ -2,9 +2,14 @@
 
 This Python script manages multiple drives to efficiently rip movies and TV series in parallel. It provides an interactive command-line interface to control the ripping process and performs automatic post-processing.
 
+## Platform Support
+
+The script is designed to be cross-platform and has been tested on **Linux** and **Windows**. It automatically adapts paths and commands for the operating system it's running on.
+
 ## Features
 
 - **Parallel control** of multiple DVD or Blu-ray drives.
+- **Cross-platform** support for Linux and Windows.
 - **Differentiated ripping modes** for movies and TV series.
 - Uses `makemkvcon` for robust ripping.
 - **Automatic post-processing** after a successful rip:
@@ -16,29 +21,28 @@ This Python script manages multiple drives to efficiently rip movies and TV seri
     - Displays a list of all potential episodes for you to select.
     - Supports flexible selection (e.g., `1,3-5,8`).
     - Prompts for Series Name, Season, and starting Episode number.
-    - Automatically names files sequentially (e.g., `My.Series.S01E05.mkv`, `My.Series.S01E06.mkv`, etc.).
-    - Includes a "reverse order" option for discs where tracks are authored backwards.
+    - Automatically names files sequentially (e.g., `My.Series.S01E05.mkv`).
   - Sets the metadata title in the MKV file using `mkvpropedit`.
-  - Ejects the disc automatically after the entire queue is finished.
-- **Interactive CLI** for easy operation.
+  - Ejects the disc automatically after the entire queue is finished (Linux only).
+- **Interactive CLI** with a responsive, non-blocking interface.
 - **Efficient rescan mode** that only checks drives that are idle or completed.
 
 ## Requirements
 
 - Python 3
-- MakeMKV (`makemkvcon` CLI tool)
-- MKVToolNix (`mkvpropedit` CLI tool)
-- The `eject` command (usually preinstalled on most Linux distributions).
+- **MakeMKV**: The `makemkvcon` (or `makemkvcon64.exe`) command-line tool must be available.
+- **MKVToolNix**: The `mkvpropedit` command-line tool is optional but recommended for setting metadata titles.
+- **Linux**: The `eject` command (usually preinstalled).
+- **Windows**: No special requirements for ejecting, but you may need to do so manually if the script cannot.
 
 ## Installation
 
-Ensure the required tools are installed. On Debian-based distributions (such as Ubuntu) you can install them like this:
+Ensure the required tools are installed and accessible from your system's PATH.
 
-- **MakeMKV** often needs to be downloaded from the official site or a PPA. See instructions on [makemkv.com](https://www.makemkv.com/forum/viewtopic.php?f=3&t=224).
-- **MKVToolNix** can be installed via the package manager:
-  ```bash
-  sudo apt update && sudo apt install mkvtoolnix
-  ```
+- **MakeMKV**: Download from [makemkv.com](https://www.makemkv.com). On Windows, the script will attempt to find the executable in standard installation directories. On Linux, ensure `makemkvcon` is in your PATH.
+- **MKVToolNix**: Download from [mkvtoolnix.download](https://mkvtoolnix.download/downloads.html) or install via your system's package manager.
+  - *Linux (Debian/Ubuntu)*: `sudo apt update && sudo apt install mkvtoolnix`
+  - *Windows*: Use the installer from the website.
 
 ## Usage
 
@@ -60,8 +64,8 @@ Ensure the required tools are installed. On Debian-based distributions (such as 
 
 At the top of `rip_station.py` you can adjust some constants:
 
-- `BASE_OUTPUT_DIR`: The root folder where ripped files are stored. Each movie or series gets its own subfolder.
-- `MAKEMKV_CMD`: Path to the `makemkvcon` command if it is not on your system PATH.
+- `BASE_OUTPUT_DIR`: The root folder where ripped files are stored. The script sets a default based on your OS (`/home/jens/Videos` on Linux, `C:\Users\<YourUser>\Videos` on Windows). Each movie or series gets its own subfolder.
+- `MAKEMKV_CMD`: Path to the `makemkvcon` command. On Windows, this is detected automatically. On Linux, it's assumed to be in the PATH. You can hardcode a specific path here if needed.
 
 ---
 
