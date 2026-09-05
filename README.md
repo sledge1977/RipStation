@@ -11,9 +11,11 @@ The script is designed to be cross-platform and has been tested on **Linux** and
 - **Parallel control** of multiple DVD or Blu-ray drives.
 - **Safe parallel job handling**:
   - A drive is marked busy before its worker starts and released only after cleanup.
-  - Each job keeps the MakeMKV disc ID captured at startup, even during rescans.
+  - The physical `dev:` source is preferred; `disc:` remains a tested compatibility fallback.
+  - Each job keeps the successful MakeMKV source captured at startup, even during rescans.
   - Planned output files are reserved so two drives cannot produce the same episode or movie.
   - MakeMKV writes each active track into an isolated staging directory to prevent raw filename collisions.
+  - Unexpected worker errors terminate and, if necessary, kill MakeMKV before releasing the drive.
 - **Cross-platform** support for Linux and Windows.
 - **Differentiated ripping modes** for movies and TV series.
 - Uses `makemkvcon` for robust ripping.
@@ -30,9 +32,11 @@ The script is designed to be cross-platform and has been tested on **Linux** and
     - Supports exact episode lists and gaps (for example `5-8` or `5,6,9,10`).
     - Continues numbering after existing files in the season folder by default.
     - Supports season `00` for specials and names files such as `My Series.S00E03.mkv`.
+    - Rejects mixed-season selections so detected `S01` and `S02` tracks cannot be mislabeled.
     - Refuses to overwrite an existing episode file.
   - Sets the metadata title in the MKV file using `mkvpropedit`.
   - Ejects the disc automatically after the entire queue is finished (Linux only).
+  - Uses bounded timeouts for metadata updates and drive ejection.
 - **Responsive terminal UI**:
   - Full table with progress bars on wide terminals.
   - Reduced table on medium widths and a compact card layout on narrow terminals.

@@ -170,7 +170,9 @@ def eject_drive(device_path):
             # Wir geben hier nur eine Meldung aus, um Abstürze zu vermeiden.
             print(f"Hinweis: Bitte Laufwerk {device_path} manuell auswerfen (Windows Eject nicht implementiert).")
         else:
-            subprocess.run(["eject", device_path], check=True, capture_output=True)
+            subprocess.run(
+                ["eject", device_path], check=True, capture_output=True, timeout=30
+            )
             print(f"Laufwerk {device_path} ausgeworfen.")
     except Exception as e:
         print(f"Fehler beim Auswerfen: {e}")
@@ -218,6 +220,7 @@ class Drive:
         self.progress = 0             
         self.name = name
         self.busy = False
+        self.media_source = None
 
 def scan_drives():
     global drives
@@ -253,10 +256,12 @@ def rescan_idle_drives():
                 drive.label = new_label
                 drive.status = "IDLE"
                 drive.current_job = ""
+                drive.media_source = None
         else:
             drive.label = ""
             drive.status = "IDLE"
             drive.current_job = ""
+            drive.media_source = None
 
     for d_dev, (d_id, d_name, d_label) in info_by_device.items():
         if not any(d.device_path == d_dev for d in drives):
@@ -306,17 +311,42 @@ def parse_tinfo_output(output):
             continue
     return sorted(tracks.values(), key=lambda track: track['id'])
 
-def get_disc_tracks(drive, min_len_seconds):
-    cmd = [MAKEMKV_CMD, "-r", "--cache=1", "info", f"disc:{drive.mkv_id}"]
-    try:
-        creation_flags = 0x08000000 if os.name == 'nt' else 0
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=600, creationflags=creation_flags)
-    except Exception as e:
-        print(f"Error getting track info: {e}")
-        return []
+def drive_source_candidates(drive):
+    """Prefer the physical device and retain disc ID as a compatibility fallback."""
+    candidates = []
+    if drive.device_path:
+        candidates.append(f"dev:{drive.device_path}")
+    candidates.append(f"disc:{drive.mkv_id}")
+    return list(dict.fromkeys(candidates))
 
-    tracks = parse_tinfo_output(result.stdout)
-    return [t for t in tracks if t.get('duration_seconds', 0) >= min_len_seconds]
+
+def get_disc_tracks(drive, min_len_seconds):
+    creation_flags = 0x08000000 if os.name == 'nt' else 0
+    errors = []
+    for source in drive_source_candidates(drive):
+        cmd = [MAKEMKV_CMD, "-r", "--cache=1", "info", source]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=600,
+                creationflags=creation_flags,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as error:
+            errors.append(f"{source}: {error}")
+            continue
+
+        drive.media_source = source
+        tracks = parse_tinfo_output(result.stdout)
+        return [
+            track for track in tracks
+            if track.get('duration_seconds', 0) >= min_len_seconds
+        ]
+
+    print("Trackscan fehlgeschlagen: " + "; ".join(errors))
+    return []
 
 def parse_track_selection(selection_str):
     selection = []
@@ -383,15 +413,15 @@ def analyze_series_tracks(tracks):
         fingerprint = (track.get('duration_seconds', 0), size) if size else None
         matching_tracks = fingerprints.get(fingerprint, []) if fingerprint else []
         if matching_tracks:
-            current_episode = extract_episode_info(track)[1]
+            current_identity = extract_episode_info(track)
             matching_episode = next(
                 (
                     candidate for candidate in matching_tracks
-                    if extract_episode_info(candidate)[1] == current_episode
+                    if extract_episode_info(candidate) == current_identity
                 ),
                 None,
             )
-            if current_episode is None or matching_episode is not None:
+            if current_identity[1] is None or matching_episode is not None:
                 duplicate_of[track['id']] = (
                     matching_episode or matching_tracks[0]
                 )['id']
@@ -410,8 +440,35 @@ def analyze_series_tracks(tracks):
     explicitly_numbered = [
         track for track in unique_tracks if extract_episode_info(track)[1] is not None
     ]
-    explicit_numbers = [extract_episode_info(track)[1] for track in explicitly_numbered]
-    if len(explicitly_numbered) >= 2 and len(set(explicit_numbers)) == len(explicit_numbers):
+    explicit_identities = [extract_episode_info(track) for track in explicitly_numbered]
+    explicit_seasons = {
+        season for season, _ in explicit_identities if season is not None
+    }
+    if len(explicit_seasons) > 1:
+        tracks_by_season = {
+            season: [
+                track for track in explicitly_numbered
+                if extract_episode_info(track)[0] == season
+            ]
+            for season in explicit_seasons
+        }
+        selected_season = min(
+            explicit_seasons,
+            key=lambda season: (-len(tracks_by_season[season]), season),
+        )
+        best_season_tracks = order_episode_tracks(tracks_by_season[selected_season])
+        center = int(median(track['duration_seconds'] for track in best_season_tracks))
+        return SeriesAnalysis(
+            [track['id'] for track in best_season_tracks],
+            duplicate_of,
+            "niedrig",
+            center,
+        )
+
+    if (
+        len(explicitly_numbered) >= 2
+        and len(set(explicit_identities)) == len(explicit_identities)
+    ):
         center = int(median(track['duration_seconds'] for track in explicitly_numbered))
         confidence = "hoch" if len(explicitly_numbered) == len(unique_tracks) else "mittel"
         ordered = order_episode_tracks(explicitly_numbered)
@@ -465,10 +522,17 @@ def extract_episode_info(track):
 def order_episode_tracks(tracks):
     """Use explicit episode markers only when they are complete and unambiguous."""
     tracks = list(tracks)
-    episode_numbers = [extract_episode_info(track)[1] for track in tracks]
-    if episode_numbers and all(number is not None for number in episode_numbers):
-        if len(set(episode_numbers)) == len(episode_numbers):
-            return sorted(tracks, key=lambda track: extract_episode_info(track)[1])
+    identities = [extract_episode_info(track) for track in tracks]
+    if identities and all(episode is not None for _, episode in identities):
+        if len(set(identities)) == len(identities):
+            return sorted(
+                tracks,
+                key=lambda track: (
+                    extract_episode_info(track)[0]
+                    if extract_episode_info(track)[0] is not None else -1,
+                    extract_episode_info(track)[1],
+                ),
+            )
     return sorted(tracks, key=lambda track: track['id'])
 
 
@@ -676,16 +740,22 @@ def prompt_series_jobs(tracks):
             return []
         selected_tracks = [by_id[track_id] for track_id in ordered_ids]
 
+    inferred_seasons = {
+        season for season, episode in map(extract_episode_info, selected_tracks)
+        if season is not None and episode is not None
+    }
+    if len(inferred_seasons) > 1:
+        season_list = ", ".join(str(season) for season in sorted(inferred_seasons))
+        print(f"Abbruch: Die Auswahl enthält Titel aus mehreren Staffeln ({season_list}).")
+        print("Bitte nur Titel einer Staffel auswählen.")
+        return []
+
     raw_name = input("Serienname: ").strip()
     if not safe_media_name(raw_name):
         print("Serienname ist leer oder ungültig. Abbruch.")
         return []
 
-    inferred_seasons = {
-        season for season, episode in map(extract_episode_info, selected_tracks)
-        if season is not None and episode is not None
-    }
-    season_default = inferred_seasons.pop() if len(inferred_seasons) == 1 else 1
+    season_default = next(iter(inferred_seasons)) if inferred_seasons else 1
     season_number = prompt_integer("Staffel", season_default, minimum=0)
 
     inferred_episodes = [extract_episode_info(track)[1] for track in selected_tracks]
@@ -769,6 +839,24 @@ def remove_empty_directory(path):
         pass
 
 
+def ensure_process_stopped(proc, timeout=10):
+    """Terminate and, if necessary, kill a child that did not exit normally."""
+    if proc is None or getattr(proc, 'returncode', None) is not None:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    except (OSError, ProcessLookupError):
+        # The process disappeared between poll and signal.
+        return
+
+
 def _rip_jobs_worker(drive, jobs, disc_source):
     drive.status = "Starting..."
     drive.progress = 0
@@ -803,32 +891,38 @@ def _rip_jobs_worker(drive, jobs, disc_source):
 
         with open(log_file, "a") as f:
             f.write(f"\n--- Starting Job {job_progress_text}: Rip Track {track_id} ---\n")
+            proc = None
             try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    creationflags=creation_flags,
-                )
-            except OSError as error:
-                f.write(f"ERROR: MakeMKV konnte nicht gestartet werden: {error}\n")
-                drive.status = "ERROR (Start)"
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        creationflags=creation_flags,
+                    )
+                except OSError as error:
+                    f.write(f"ERROR: MakeMKV konnte nicht gestartet werden: {error}\n")
+                    drive.status = "ERROR (Start)"
+                    remove_empty_directory(staging_dir)
+                    break
+
+                for line in proc.stdout:
+                    f.write(line)
+                    if line.startswith("PRGV:"):
+                        try:
+                            parts = line.split(":")[1].strip().split(",")
+                            current, total = int(parts[0]), int(parts[2])
+                            drive.progress = int((current / total) * 100)
+                        except (ValueError, IndexError, ZeroDivisionError):
+                            pass
+
+                proc.wait()
+            finally:
+                ensure_process_stopped(proc)
                 remove_empty_directory(staging_dir)
-                break
-            
-            for line in proc.stdout:
-                f.write(line)
-                if line.startswith("PRGV:"):
-                    try:
-                        parts = line.split(":")[1].strip().split(",")
-                        current, total = int(parts[0]), int(parts[2])
-                        drive.progress = int((current / total) * 100)
-                    except (ValueError, IndexError, ZeroDivisionError):
-                        pass
-            
-            proc.wait()
+
             drive.status = f"Processing {job_progress_text}"
 
             if proc.returncode == 0:
@@ -857,14 +951,15 @@ def _rip_jobs_worker(drive, jobs, disc_source):
                              f"title={os.path.splitext(os.path.basename(final_output_path))[0]}"],
                             capture_output=True,
                             text=True,
+                            timeout=120,
                             creationflags=creation_flags,
                         )
                         if meta_result.returncode != 0:
                             metadata_warning = True
                             f.write(f"WARNING: mkvpropedit: {meta_result.stderr.strip()}\n")
-                    except FileNotFoundError:
+                    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
                         metadata_warning = True
-                        f.write("WARNING: mkvpropedit wurde nicht gefunden.\n")
+                        f.write(f"WARNING: mkvpropedit nicht verfügbar oder Timeout: {error}\n")
                 except Exception as e:
                     f.write(f"ERROR: {e}\n")
                     drive.status = "ERROR (Post)"
@@ -891,7 +986,7 @@ def _rip_jobs_worker(drive, jobs, disc_source):
 
 def rip_jobs_worker(drive, jobs, disc_source=None, owns_job_state=False):
     """Keep unexpected filesystem/process errors from leaving a drive busy forever."""
-    disc_source = disc_source or f"disc:{drive.mkv_id}"
+    disc_source = disc_source or drive.media_source or drive_source_candidates(drive)[0]
     try:
         _rip_jobs_worker(drive, jobs, disc_source)
     except Exception as error:
@@ -929,7 +1024,7 @@ def start_rip_jobs(drive, jobs):
         drive.busy = True
         drive.status = "Starting..."
         drive.progress = 0
-        disc_source = f"disc:{drive.mkv_id}"
+        disc_source = drive.media_source or drive_source_candidates(drive)[0]
 
     try:
         thread = threading.Thread(

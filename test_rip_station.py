@@ -1,5 +1,6 @@
 import io
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -47,6 +48,26 @@ class ParsingTests(unittest.TestCase):
         with patch('rip_station.subprocess.run', side_effect=FileNotFoundError('missing')):
             with self.assertRaises(RuntimeError):
                 rip_station.fetch_drive_info()
+
+    def test_track_scan_prefers_device_source(self):
+        drive = rip_station.Drive(3, '/dev/sr3', 'DISC', 'Drive')
+        result = SimpleNamespace(stdout='TINFO:0,9,0,"0:42:00"')
+        with patch('rip_station.subprocess.run', return_value=result) as run:
+            tracks = rip_station.get_disc_tracks(drive, 60)
+        self.assertEqual(tracks[0]['id'], 0)
+        self.assertEqual(run.call_args.args[0][-1], 'dev:/dev/sr3')
+        self.assertEqual(drive.media_source, 'dev:/dev/sr3')
+
+    def test_track_scan_falls_back_to_disc_id(self):
+        drive = rip_station.Drive(3, '/dev/sr3', 'DISC', 'Drive')
+        result = SimpleNamespace(stdout='TINFO:0,9,0,"0:42:00"')
+        first_error = subprocess.CalledProcessError(1, ['makemkvcon'])
+        with patch('rip_station.subprocess.run', side_effect=[first_error, result]) as run:
+            tracks = rip_station.get_disc_tracks(drive, 60)
+        self.assertTrue(tracks)
+        self.assertEqual(run.call_args_list[0].args[0][-1], 'dev:/dev/sr3')
+        self.assertEqual(run.call_args_list[1].args[0][-1], 'disc:3')
+        self.assertEqual(drive.media_source, 'disc:3')
 
     def test_non_tty_menu_accepts_multi_digit_drive_id(self):
         stream = io.StringIO('12\n')
@@ -159,6 +180,23 @@ class SeriesDetectionTests(unittest.TestCase):
         self.assertEqual(analysis.duplicate_of, {})
         self.assertEqual(analysis.recommended_ids, [1, 2])
 
+    def test_same_episode_number_in_different_seasons_is_not_a_duplicate(self):
+        tracks = [
+            track(1, 1500, 100, title_name='Show S01E01'),
+            track(2, 1500, 100, title_name='Show S02E01'),
+        ]
+        analysis = rip_station.analyze_series_tracks(tracks)
+        self.assertEqual(analysis.duplicate_of, {})
+
+    def test_mixed_seasons_recommend_only_one_season(self):
+        tracks = [
+            track(0, 1500, 100, title_name='Show S01E01'),
+            track(1, 1500, 101, title_name='Show S02E02'),
+        ]
+        analysis = rip_station.analyze_series_tracks(tracks)
+        self.assertEqual(analysis.recommended_ids, [0])
+        self.assertEqual(analysis.confidence, 'niedrig')
+
     def test_explicit_numbers_beat_different_runtimes(self):
         tracks = [
             track(1, 1500, 100, title_name='Show S01E01'),
@@ -229,6 +267,19 @@ class JobTests(unittest.TestCase):
             'Show.S01E06.mkv',
         ])
 
+    def test_prompt_rejects_tracks_from_multiple_seasons(self):
+        tracks = [
+            track(0, 1500, 100, title_name='Show S01E01'),
+            track(1, 1500, 101, title_name='Show S02E02'),
+        ]
+        answers = iter(['*', ''])
+        output = io.StringIO()
+        with patch('builtins.input', side_effect=lambda _='': next(answers)), \
+                redirect_stdout(output):
+            jobs = rip_station.prompt_series_jobs(tracks)
+        self.assertEqual(jobs, [])
+        self.assertIn('mehreren Staffeln (1, 2)', output.getvalue())
+
     def test_worker_reports_unexpected_setup_error(self):
         drive = rip_station.Drive(0, '/dev/test', 'disc', 'drive')
         with patch('rip_station.os.makedirs', side_effect=OSError('read only')), \
@@ -293,6 +344,83 @@ class JobTests(unittest.TestCase):
             self.assertFalse(list(Path(temp_dir).glob('.ripstation-*')))
             self.assertEqual(drive.status, 'COMPLETED')
 
+    def test_worker_terminates_and_kills_hung_process_before_release(self):
+        drive = rip_station.Drive(5, '/dev/sr5', 'DISC', 'Drive')
+
+        class BrokenOutput:
+            def __iter__(self):
+                raise OSError('stdout failed')
+
+        class HungProcess:
+            stdout = BrokenOutput()
+            returncode = None
+            terminated = False
+            killed = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired('makemkvcon', timeout)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                self.killed = True
+
+        process = HungProcess()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = os.path.join(temp_dir, 'Movie.mkv')
+            jobs = [(1, output, 'title.mkv')]
+            drive.busy = True
+            with rip_station.job_state_lock:
+                rip_station.reserved_outputs.add(rip_station.canonical_output_path(output))
+            with patch('rip_station.subprocess.Popen', return_value=process), \
+                    redirect_stdout(io.StringIO()):
+                rip_station.rip_jobs_worker(
+                    drive, jobs, 'dev:/dev/sr5', owns_job_state=True
+                )
+            self.assertFalse(list(Path(temp_dir).glob('.ripstation-*')))
+
+        self.assertTrue(process.terminated)
+        self.assertTrue(process.killed)
+        self.assertFalse(drive.busy)
+        self.assertFalse(rip_station.reserved_outputs)
+        self.assertEqual(drive.status, 'ERROR (Worker)')
+
+    def test_metadata_timeout_is_only_a_warning(self):
+        drive = rip_station.Drive(6, '/dev/sr6', 'DISC', 'Drive')
+
+        class SuccessfulProcess:
+            stdout = []
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def start_process(command, **_kwargs):
+            Path(command[-1], 'generated.mkv').touch()
+            return SuccessfulProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs = [(1, os.path.join(temp_dir, 'Movie.mkv'), '')]
+            timeout = subprocess.TimeoutExpired('mkvpropedit', 120)
+            with patch('rip_station.subprocess.Popen', side_effect=start_process), \
+                    patch('rip_station.subprocess.run', side_effect=timeout) as run, \
+                    patch('rip_station.eject_drive'):
+                rip_station._rip_jobs_worker(drive, jobs, 'dev:/dev/sr6')
+        self.assertEqual(drive.status, 'COMPLETED (META WARN)')
+        self.assertEqual(run.call_args.kwargs['timeout'], 120)
+
+    def test_eject_has_timeout(self):
+        with patch('rip_station.subprocess.run') as run, redirect_stdout(io.StringIO()):
+            rip_station.eject_drive('/dev/sr0')
+        self.assertEqual(run.call_args.kwargs['timeout'], 30)
+
     def test_rescan_does_not_mutate_busy_drive(self):
         drive = rip_station.Drive(2, '/dev/sr2', 'OLD_DISC', 'Old drive')
         drive.busy = True
@@ -308,7 +436,7 @@ class JobTests(unittest.TestCase):
             rip_station.drives = original_drives
         self.assertEqual((drive.mkv_id, drive.name, drive.label), (2, 'Old drive', 'OLD_DISC'))
 
-    def test_start_reserves_outputs_and_keeps_disc_id_stable(self):
+    def test_start_reserves_outputs_and_keeps_source_stable(self):
         entered = rip_station.threading.Event()
         finish = rip_station.threading.Event()
         captured_sources = []
@@ -338,7 +466,7 @@ class JobTests(unittest.TestCase):
                     _, second_error = rip_station.start_rip_jobs(second_drive, jobs)
                     self.assertIn('reserviert', second_error)
                     self.assertFalse(second_drive.busy)
-                    self.assertEqual(captured_sources, ['disc:4'])
+                    self.assertEqual(captured_sources, ['dev:/dev/sr4'])
                 finally:
                     finish.set()
                     thread.join(2)
