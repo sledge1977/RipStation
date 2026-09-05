@@ -17,14 +17,24 @@ The script is designed to be cross-platform and has been tested on **Linux** and
     - Automatically finds all titles longer than 60 minutes.
     - Selects the longest title as the main feature.
   - **For TV Series**:
-    - Finds all titles longer than 20 minutes.
-    - Displays a list of all potential episodes for you to select.
-    - Supports flexible selection (e.g., `1,3-5,8`).
-    - Prompts for Series Name, Season, and starting Episode number.
-    - Automatically names files sequentially (e.g., `My.Series.S01E05.mkv`).
+    - Groups tracks with similar runtimes and recommends the most likely episode block.
+    - Marks probable duplicate playlists instead of silently ripping them twice.
+    - Detects common episode labels such as `S01E05`, `1x05`, `Episode 5`, and `Folge 5`.
+    - Shows every track from one minute onward, so short-form series remain selectable.
+    - Lets you confirm or change selection and track order (including reverse order).
+    - Supports exact episode lists and gaps (for example `5-8` or `5,6,9,10`).
+    - Continues numbering after existing files in the season folder by default.
+    - Supports season `00` for specials and names files such as `My Series.S00E03.mkv`.
+    - Refuses to overwrite an existing episode file.
   - Sets the metadata title in the MKV file using `mkvpropedit`.
   - Ejects the disc automatically after the entire queue is finished (Linux only).
-- **Interactive CLI** with a responsive, non-blocking interface.
+- **Responsive terminal UI**:
+  - Full table with progress bars on wide terminals.
+  - Reduced table on medium widths and a compact card layout on narrow terminals.
+  - Adapts to terminal resizing and clips long Unicode labels without breaking columns.
+  - Limits visible rows on short terminals and reports how many drives are hidden.
+  - Dashboard commands react immediately without requiring Enter.
+- **Non-blocking operation** while multiple drives are ripping.
 - **Efficient rescan mode** that only checks drives that are idle or completed.
 
 ## Requirements
@@ -64,8 +74,16 @@ Ensure the required tools are installed and accessible from your system's PATH.
 
 At the top of `rip_station.py` you can adjust some constants:
 
-- `BASE_OUTPUT_DIR`: The root folder where ripped files are stored. The script sets a default based on your OS (`/home/jens/Videos` on Linux, `C:\Users\<YourUser>\Videos` on Windows). Each movie or series gets its own subfolder.
+- `BASE_OUTPUT_DIR`: The root folder where ripped files are stored. It defaults to the current user's `Videos` folder on Linux and Windows. Each movie or series gets its own subfolder.
 - `MAKEMKV_CMD`: Path to the `makemkvcon` command. On Windows, this is detected automatically. On Linux, it's assumed to be in the PATH. You can hardcode a specific path here if needed.
+
+## Tests
+
+The episode detection and numbering logic can be tested without a disc or MakeMKV:
+
+```bash
+python3 -m unittest -v
+```
 
 ---
 
