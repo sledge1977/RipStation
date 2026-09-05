@@ -899,6 +899,7 @@ def _rip_jobs_worker(drive, jobs, disc_source):
         job_progress_text = f"({i+1}/{total_jobs})"
         drive.status = f"Ripping {job_progress_text}"
         drive.current_job = os.path.basename(final_output_path)
+        drive.progress = 0
 
         target_dir = os.path.dirname(final_output_path)
         os.makedirs(target_dir, exist_ok=True)

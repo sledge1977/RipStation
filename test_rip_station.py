@@ -358,6 +358,35 @@ class JobTests(unittest.TestCase):
             self.assertFalse(list(Path(temp_dir).glob('.ripstation-*')))
             self.assertEqual(drive.status, 'COMPLETED')
 
+    def test_worker_resets_progress_before_each_track(self):
+        drive = rip_station.Drive(3, '/dev/sr3', 'DISC', 'Drive')
+        progress_at_start = []
+
+        class SuccessfulProcess:
+            stdout = ['PRGV:0,100,100\n']
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def start_process(command, **_kwargs):
+            progress_at_start.append(drive.progress)
+            Path(command[-1], 'generated.mkv').touch()
+            return SuccessfulProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs = [
+                (1, os.path.join(temp_dir, 'Show.S01E01.mkv'), ''),
+                (2, os.path.join(temp_dir, 'Show.S01E02.mkv'), ''),
+            ]
+            with patch('rip_station.subprocess.Popen', side_effect=start_process), \
+                    patch('rip_station.subprocess.run', return_value=SimpleNamespace(
+                        returncode=0, stderr=''
+                    )), patch('rip_station.eject_drive'):
+                rip_station._rip_jobs_worker(drive, jobs, 'dev:/dev/sr3')
+
+        self.assertEqual(progress_at_start, [0, 0])
+
     def test_worker_terminates_and_kills_hung_process_before_release(self):
         drive = rip_station.Drive(5, '/dev/sr5', 'DISC', 'Drive')
 
