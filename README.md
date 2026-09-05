@@ -9,13 +9,18 @@ The script is designed to be cross-platform and has been tested on **Linux** and
 ## Features
 
 - **Parallel control** of multiple DVD or Blu-ray drives.
+- **Safe parallel job handling**:
+  - A drive is marked busy before its worker starts and released only after cleanup.
+  - Each job keeps the MakeMKV disc ID captured at startup, even during rescans.
+  - Planned output files are reserved so two drives cannot produce the same episode or movie.
+  - MakeMKV writes each active track into an isolated staging directory to prevent raw filename collisions.
 - **Cross-platform** support for Linux and Windows.
 - **Differentiated ripping modes** for movies and TV series.
 - Uses `makemkvcon` for robust ripping.
 - **Automatic post-processing** after a successful rip:
   - **For Movies**:
     - Automatically finds all titles longer than 60 minutes.
-    - Selects the longest title as the main feature.
+    - Recommends the longest title while still showing all candidates for confirmation.
   - **For TV Series**:
     - Groups tracks with similar runtimes and recommends the most likely episode block.
     - Marks probable duplicate playlists instead of silently ripping them twice.
@@ -33,7 +38,7 @@ The script is designed to be cross-platform and has been tested on **Linux** and
   - Reduced table on medium widths and a compact card layout on narrow terminals.
   - Adapts to terminal resizing and clips long Unicode labels without breaking columns.
   - Limits visible rows on short terminals and reports how many drives are hidden.
-  - Dashboard commands react immediately without requiring Enter.
+  - Dashboard commands react immediately without requiring Enter and support multi-digit drive IDs.
 - **Non-blocking operation** while multiple drives are ripping.
 - **Efficient rescan mode** that only checks drives that are idle or completed.
 
@@ -63,10 +68,10 @@ Ensure the required tools are installed and accessible from your system's PATH.
 2. The script first scans all available drives.
 3. The UI appears and lists all detected drives.
 4. Use these commands:
-    - `[0-9]`: Enter the ID of the drive you want to rip and press Enter.
+    - `[ID]`: Enter the drive ID. Unambiguous IDs react immediately; ambiguous prefixes briefly wait for another digit. Enter is optional and multi-digit IDs are supported.
       - You will be prompted to choose **Movie** or **Series**.
-      - **If Movie**: The script automatically selects the longest track. You will only be asked for the movie's name.
-      - **If Series**: You will be shown a list of all tracks matching the minimum length for an episode. You can select the tracks to rip, and will then be asked for the series name, season, and starting episode number.
+      - **If Movie**: All candidates are displayed. The longest is recommended, but you can select a different title.
+      - **If Series**: You will be shown the analyzed track list and can confirm selection, order, season, and exact episode numbers.
     - `[r]`: Triggers a quick rescan. Only drives with status `IDLE` or `COMPLETED` are checked for new discs.
     - `[q]`: Quits the program.
 

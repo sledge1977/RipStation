@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import rip_station
@@ -41,6 +42,22 @@ class ParsingTests(unittest.TestCase):
 
     def test_range_formatting(self):
         self.assertEqual(rip_station.format_number_ranges([1, 2, 3, 6, 8, 7]), '1-3,6,8-7')
+
+    def test_fetch_drive_info_raises_instead_of_exiting(self):
+        with patch('rip_station.subprocess.run', side_effect=FileNotFoundError('missing')):
+            with self.assertRaises(RuntimeError):
+                rip_station.fetch_drive_info()
+
+    def test_non_tty_menu_accepts_multi_digit_drive_id(self):
+        stream = io.StringIO('12\n')
+        with patch.object(rip_station.sys, 'stdin', stream), \
+                patch('rip_station.select.select', return_value=([stream], [], [])):
+            self.assertEqual(rip_station.read_menu_command(), '12')
+
+    def test_drive_id_prefix_waits_only_when_ambiguous(self):
+        self.assertFalse(rip_station.command_needs_more_digits('1', [0, 1, 2]))
+        self.assertTrue(rip_station.command_needs_more_digits('1', [1, 10, 12]))
+        self.assertFalse(rip_station.command_needs_more_digits('10', [1, 10, 12]))
 
 
 class ResponsiveUiTests(unittest.TestCase):
@@ -160,6 +177,14 @@ class SeriesDetectionTests(unittest.TestCase):
 
 
 class JobTests(unittest.TestCase):
+    def setUp(self):
+        with rip_station.job_state_lock:
+            rip_station.reserved_outputs.clear()
+
+    def tearDown(self):
+        with rip_station.job_state_lock:
+            rip_station.reserved_outputs.clear()
+
     def test_custom_episode_numbers_and_portable_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(rip_station, 'BASE_OUTPUT_DIR', temp_dir):
@@ -211,6 +236,161 @@ class JobTests(unittest.TestCase):
             rip_station.rip_jobs_worker(drive, [(1, '/video/Show.S01E01.mkv', 'title.mkv')])
         self.assertEqual(drive.status, 'ERROR (Worker)')
         self.assertEqual(drive.progress, 0)
+
+    def test_windows_reserved_names_are_prefixed(self):
+        for value in ('CON', 'prn', 'AUX.txt', 'NUL', 'COM1', 'lpt9'):
+            with self.subTest(value=value):
+                self.assertTrue(rip_station.safe_media_name(value).startswith('_'))
+        self.assertEqual(rip_station.safe_media_name('COM10'), 'COM10')
+
+    def test_find_created_mkv_ignores_empty_name_and_stale_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stale = Path(temp_dir, 'stale.mkv')
+            stale.touch()
+            files_before = {stale}
+            created = Path(temp_dir, 'new.mkv')
+            created.touch()
+            self.assertEqual(
+                rip_station.find_created_mkv(temp_dir, '', files_before),
+                str(created),
+            )
+
+    def test_find_created_mkv_fails_without_a_new_regular_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stale = Path(temp_dir, 'title.mkv')
+            stale.touch()
+            with self.assertRaises(FileNotFoundError):
+                rip_station.find_created_mkv(temp_dir, 'title.mkv', {stale})
+
+    def test_worker_uses_fixed_source_and_isolated_staging_directory(self):
+        drive = rip_station.Drive(9, '/dev/sr9', 'DISC', 'Drive')
+        commands = []
+
+        class SuccessfulProcess:
+            stdout = []
+            returncode = 0
+
+            def wait(self):
+                return 0
+
+        def start_process(command, **_kwargs):
+            commands.append(command)
+            Path(command[-1], 'generated.mkv').touch()
+            return SuccessfulProcess()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_output = Path(temp_dir, 'Movie.mkv')
+            jobs = [(1, str(final_output), '')]
+            with patch('rip_station.subprocess.Popen', side_effect=start_process), \
+                    patch('rip_station.subprocess.run', return_value=SimpleNamespace(
+                        returncode=0, stderr=''
+                    )), patch('rip_station.eject_drive'):
+                rip_station._rip_jobs_worker(drive, jobs, 'disc:9')
+
+            self.assertTrue(final_output.is_file())
+            self.assertEqual(commands[0][4], 'disc:9')
+            self.assertNotEqual(commands[0][-1], temp_dir)
+            self.assertFalse(list(Path(temp_dir).glob('.ripstation-*')))
+            self.assertEqual(drive.status, 'COMPLETED')
+
+    def test_rescan_does_not_mutate_busy_drive(self):
+        drive = rip_station.Drive(2, '/dev/sr2', 'OLD_DISC', 'Old drive')
+        drive.busy = True
+        drive.status = 'Ripping (1/2)'
+        original_drives = rip_station.drives
+        rip_station.drives = [drive]
+        try:
+            with patch('rip_station.fetch_drive_info', return_value=[
+                    (12, 'New drive', 'NEW_DISC', '/dev/sr2')
+                 ]), patch('rip_station.time.sleep'), redirect_stdout(io.StringIO()):
+                rip_station.rescan_idle_drives()
+        finally:
+            rip_station.drives = original_drives
+        self.assertEqual((drive.mkv_id, drive.name, drive.label), (2, 'Old drive', 'OLD_DISC'))
+
+    def test_start_reserves_outputs_and_keeps_disc_id_stable(self):
+        entered = rip_station.threading.Event()
+        finish = rip_station.threading.Event()
+        captured_sources = []
+        first_drive = rip_station.Drive(4, '/dev/sr4', 'DISC_A', 'Drive A')
+        second_drive = rip_station.Drive(7, '/dev/sr7', 'DISC_B', 'Drive B')
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs = [(1, os.path.join(temp_dir, 'Show.S01E01.mkv'), 'title.mkv')]
+
+            def blocking_worker(_drive, _jobs, disc_source):
+                captured_sources.append(disc_source)
+                entered.set()
+                finish.wait(2)
+
+            with patch('rip_station._rip_jobs_worker', side_effect=blocking_worker):
+                thread, error = rip_station.start_rip_jobs(first_drive, jobs)
+                try:
+                    self.assertIsNone(error)
+                    self.assertTrue(entered.wait(1))
+                    self.assertTrue(first_drive.busy)
+                    self.assertIn(
+                        rip_station.canonical_output_path(jobs[0][1]),
+                        rip_station.reserved_outputs,
+                    )
+
+                    first_drive.mkv_id = 99
+                    _, second_error = rip_station.start_rip_jobs(second_drive, jobs)
+                    self.assertIn('reserviert', second_error)
+                    self.assertFalse(second_drive.busy)
+                    self.assertEqual(captured_sources, ['disc:4'])
+                finally:
+                    finish.set()
+                    thread.join(2)
+
+        self.assertFalse(first_drive.busy)
+        self.assertFalse(rip_station.reserved_outputs)
+
+    def test_failed_thread_start_releases_drive_and_outputs(self):
+        drive = rip_station.Drive(1, '/dev/sr1', 'DISC', 'Drive')
+        jobs = [(1, '/video/Movie/Movie.mkv', 'title.mkv')]
+        with patch('rip_station.threading.Thread', side_effect=RuntimeError('no thread')):
+            thread, error = rip_station.start_rip_jobs(drive, jobs)
+        self.assertIsNone(thread)
+        self.assertIn('nicht gestartet', error)
+        self.assertFalse(drive.busy)
+        self.assertFalse(rip_station.reserved_outputs)
+        self.assertEqual(drive.status, 'ERROR (Start)')
+
+    def test_existing_output_is_rejected_before_worker_start(self):
+        drive = rip_station.Drive(1, '/dev/sr1', 'DISC', 'Drive')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir, 'Movie.mkv')
+            output.touch()
+            thread, error = rip_station.start_rip_jobs(
+                drive, [(1, str(output), 'title.mkv')]
+            )
+        self.assertIsNone(thread)
+        self.assertIn('vorhanden', error)
+        self.assertFalse(drive.busy)
+
+    def test_reserved_episodes_are_included_in_next_number(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(rip_station, 'BASE_OUTPUT_DIR', temp_dir):
+            jobs = rip_station.build_series_jobs(
+                'Show', 1,
+                [track(1, 1500, 1), track(2, 1500, 2)],
+                [1, 2],
+            )
+            with rip_station.job_state_lock:
+                rip_station.reserved_outputs.update(
+                    rip_station.canonical_output_path(job[1]) for job in jobs
+                )
+            self.assertEqual(rip_station.next_episode_number('Show', 1), 3)
+
+    def test_movie_prompt_can_override_longest_title(self):
+        tracks = [track(1, 4000, 1), track(2, 5000, 2)]
+        answers = iter(['1', 'Movie'])
+        with patch('builtins.input', side_effect=lambda _='': next(answers)), \
+                redirect_stdout(io.StringIO()):
+            jobs = rip_station.prompt_movie_jobs(tracks)
+        self.assertEqual(jobs[0][0], 1)
+        self.assertEqual(os.path.basename(jobs[0][1]), 'Movie.mkv')
 
 
 if __name__ == '__main__':

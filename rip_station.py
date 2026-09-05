@@ -8,6 +8,7 @@ import csv
 import select
 import re
 import shutil
+import tempfile
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,8 @@ SERIES_TYPICAL_MAX_SECONDS = 95 * 60
 
 # Global list of drives
 drives = []
+reserved_outputs = set()
+job_state_lock = threading.Lock()
 
 
 @dataclass
@@ -60,7 +63,8 @@ class SeriesAnalysis:
 
 
 def drive_is_available(drive):
-    return not drive.status.startswith(("Starting", "Ripping", "Processing"))
+    with job_state_lock:
+        return not drive.busy
 
 # --- HELPER FUNCTIONS ---
 
@@ -72,8 +76,18 @@ def clear_screen():
         sys.stdout.write('\033[2J\033[H')
 
 
-def read_menu_command(timeout=1.0):
-    """Read one dashboard key immediately; regular input() remains line based."""
+def command_needs_more_digits(digits, valid_ids):
+    if valid_ids is None:
+        return True
+    prefix = str(digits)
+    return any(
+        str(drive_id).startswith(prefix) and len(str(drive_id)) > len(prefix)
+        for drive_id in valid_ids
+    )
+
+
+def read_menu_command(timeout=1.0, digit_timeout=0.75, valid_ids=None):
+    """Read dashboard commands immediately while accepting multi-digit IDs."""
     if os.name == 'nt':
         end_wait = time.time() + timeout
         while time.time() < end_wait:
@@ -82,7 +96,31 @@ def read_menu_command(timeout=1.0):
                     char = msvcrt.getwche()
                 except (OSError, UnicodeError):
                     return None
-                return char if char not in ('\r', '\n') else None
+                if char in ('\r', '\n'):
+                    return None
+                if not char.isdigit():
+                    return char
+                digits = char
+                if not command_needs_more_digits(digits, valid_ids):
+                    return digits
+                digit_deadline = time.time() + digit_timeout
+                while len(digits) < 6 and time.time() < digit_deadline:
+                    if not msvcrt.kbhit():
+                        time.sleep(0.02)
+                        continue
+                    try:
+                        next_char = msvcrt.getwche()
+                    except (OSError, UnicodeError):
+                        break
+                    if next_char in ('\r', '\n'):
+                        break
+                    if not next_char.isdigit():
+                        break
+                    digits += next_char
+                    if not command_needs_more_digits(digits, valid_ids):
+                        break
+                    digit_deadline = time.time() + digit_timeout
+                return digits
             time.sleep(0.05)
         return None
 
@@ -100,7 +138,26 @@ def read_menu_command(timeout=1.0):
         if not readable:
             return None
         char = sys.stdin.read(1)
-        return char if char else 'q'
+        if not char:
+            return 'q'
+        if not char.isdigit():
+            return char
+        digits = char
+        if not command_needs_more_digits(digits, valid_ids):
+            return digits
+        while len(digits) < 6:
+            readable, _, _ = select.select([sys.stdin], [], [], digit_timeout)
+            if not readable:
+                break
+            next_char = sys.stdin.read(1)
+            if next_char in ('\r', '\n', ''):
+                break
+            if not next_char.isdigit():
+                break
+            digits += next_char
+            if not command_needs_more_digits(digits, valid_ids):
+                break
+        return digits
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, previous_settings)
 
@@ -131,9 +188,9 @@ def fetch_drive_info():
             
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120, creationflags=creation_flags)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-        print(f"FATAL: makemkvcon failed to run. Path: {MAKEMKV_CMD}")
-        print(f"Error: {e}")
-        sys.exit(1)
+        raise RuntimeError(
+            f"makemkvcon konnte nicht ausgeführt werden ({MAKEMKV_CMD}): {e}"
+        ) from e
 
     drives_info = []
     for line in result.stdout.splitlines():
@@ -159,7 +216,8 @@ class Drive:
         self.status = "IDLE"      
         self.current_job = ""         
         self.progress = 0             
-        self.name = name              
+        self.name = name
+        self.busy = False
 
 def scan_drives():
     global drives
@@ -175,27 +233,30 @@ def rescan_idle_drives():
     print("Rescanning drives...")
     try:
         drives_info = fetch_drive_info()
-    except Exception:
+    except Exception as error:
+        print(f"Rescan fehlgeschlagen: {error}")
+        time.sleep(2)
         return
 
     info_by_device = {d_dev: (d_id, d_name, d_label) for d_id, d_name, d_label, d_dev in drives_info}
 
     for drive in drives:
         info = info_by_device.pop(drive.device_path, None)
+        if not drive_is_available(drive):
+            # Keep every property used by an active worker stable.
+            continue
         if info:
             new_id, new_name, new_label = info
             drive.mkv_id = new_id
             drive.name = new_name
             if drive.label != new_label:
                 drive.label = new_label
-                if drive_is_available(drive):
-                    drive.status = "IDLE"
-                    drive.current_job = ""
-        else:
-            drive.label = ""
-            if drive_is_available(drive):
                 drive.status = "IDLE"
                 drive.current_job = ""
+        else:
+            drive.label = ""
+            drive.status = "IDLE"
+            drive.current_job = ""
 
     for d_dev, (d_id, d_name, d_label) in info_by_device.items():
         if not any(d.device_path == d_dev for d in drives):
@@ -436,8 +497,23 @@ def format_number_ranges(numbers):
 def safe_media_name(value):
     """Create one portable path component without changing ordinary spaces."""
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', value.strip())
-    return value.rstrip('. ')
+    value = value.rstrip('. ')
+    windows_reserved = re.compile(
+        r'(?i)^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)'
+    )
+    if windows_reserved.match(value):
+        value = f"_{value}"
+    return value
 
+
+def canonical_output_path(path):
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def release_output_paths(jobs):
+    paths = {canonical_output_path(output) for _, output, _ in jobs}
+    with job_state_lock:
+        reserved_outputs.difference_update(paths)
 
 def build_series_jobs(series_name, season_number, tracks, episode_numbers):
     if len(tracks) != len(episode_numbers):
@@ -456,14 +532,24 @@ def build_series_jobs(series_name, season_number, tracks, episode_numbers):
 
 
 def next_episode_number(series_name, season_number):
-    """Continue after the highest existing episode in the selected season."""
+    """Continue after existing and currently reserved episodes."""
     safe_name = safe_media_name(series_name)
     season_dir = Path(BASE_OUTPUT_DIR) / safe_name / f"Season {season_number:02d}"
     pattern = re.compile(rf"(?i)\.S{season_number:02d}E(\d+)")
     existing_numbers = []
-    if season_dir.is_dir():
-        for path in season_dir.glob("*.mkv"):
-            match = pattern.search(path.name)
+    canonical_season_dir = canonical_output_path(season_dir)
+    # The worker releases reservations under the same lock and only after moving
+    # its files. We therefore cannot miss an episode between both observations.
+    with job_state_lock:
+        if season_dir.is_dir():
+            for path in season_dir.glob("*.mkv"):
+                match = pattern.search(path.name)
+                if match:
+                    existing_numbers.append(int(match.group(1)))
+        for output in reserved_outputs:
+            if canonical_output_path(Path(output).parent) != canonical_season_dir:
+                continue
+            match = pattern.search(Path(output).name)
             if match:
                 existing_numbers.append(int(match.group(1)))
     return max(existing_numbers, default=0) + 1
@@ -617,16 +703,73 @@ def prompt_series_jobs(tracks):
                 break
         print(f"Bitte genau {len(selected_tracks)} unterschiedliche Folgennummern eingeben.")
 
-    jobs = build_series_jobs(raw_name, season_number, selected_tracks, episode_numbers)
-    existing = [output for _, output, _ in jobs if os.path.exists(output)]
-    if existing:
-        print("Abbruch: Folgende Zieldateien existieren bereits:")
-        for output in existing:
-            print(f"  {output}")
-        return []
-    return jobs
+    return build_series_jobs(raw_name, season_number, selected_tracks, episode_numbers)
 
-def _rip_jobs_worker(drive, jobs):
+
+def prompt_movie_jobs(tracks):
+    """Let the user confirm the longest movie candidate or choose another one."""
+    longest = max(tracks, key=lambda track: track.get('duration_seconds', 0))
+    analysis = SeriesAnalysis(
+        recommended_ids=[longest['id']],
+        duplicate_of={},
+        confidence="",
+        median_duration_seconds=longest.get('duration_seconds', 0),
+    )
+    print("\nGefundene Filmtitel (* längster Titel / Empfehlung):")
+    print(render_series_tracks(tracks, analysis))
+    while True:
+        value = input(f"Track-ID [Enter={longest['id']}, q=Abbrechen]: ").strip()
+        if value.lower() == 'q':
+            return []
+        selected_id = longest['id'] if not value else None
+        if value:
+            parsed = parse_track_selection(value)
+            if len(parsed) == 1:
+                selected_id = parsed[0]
+        selected = next((track for track in tracks if track['id'] == selected_id), None)
+        if selected:
+            break
+        print("Bitte genau eine vorhandene Track-ID eingeben.")
+
+    movie_name = safe_media_name(input("Filmname: "))
+    if not movie_name:
+        print("Filmname ist leer oder ungültig. Abbruch.")
+        return []
+    output = os.path.join(BASE_OUTPUT_DIR, movie_name, f"{movie_name}.mkv")
+    return [(selected['id'], output, selected.get('output_filename', ''))]
+
+def find_created_mkv(target_dir, source_mkv_filename, files_before_rip):
+    """Find only a regular MKV file created by the current MakeMKV invocation."""
+    before = {canonical_output_path(path) for path in files_before_rip}
+    expected = (
+        Path(target_dir) / Path(source_mkv_filename).name
+        if source_mkv_filename else None
+    )
+    if expected and expected.is_file() and canonical_output_path(expected) not in before:
+        return str(expected)
+
+    new_files = [
+        path for path in Path(target_dir).glob("*.mkv")
+        if path.is_file() and canonical_output_path(path) not in before
+    ]
+    if len(new_files) == 1:
+        return str(new_files[0])
+    expected_text = str(expected) if expected else "kein Dateiname von MakeMKV gemeldet"
+    raise FileNotFoundError(
+        f"MakeMKV-Ausgabedatei nicht eindeutig gefunden ({expected_text}, "
+        f"{len(new_files)} neue MKV-Dateien)"
+    )
+
+
+def remove_empty_directory(path):
+    """Remove a completed staging directory, retaining failed rip artifacts."""
+    try:
+        Path(path).rmdir()
+    except OSError:
+        pass
+
+
+def _rip_jobs_worker(drive, jobs, disc_source):
     drive.status = "Starting..."
     drive.progress = 0
     total_jobs = len(jobs)
@@ -641,9 +784,18 @@ def _rip_jobs_worker(drive, jobs):
 
         target_dir = os.path.dirname(final_output_path)
         os.makedirs(target_dir, exist_ok=True)
-        files_before_rip = set(Path(target_dir).glob("*.mkv"))
+        staging_dir = tempfile.mkdtemp(
+            prefix=f".ripstation-{drive.mkv_id}-{track_id}-",
+            dir=target_dir,
+        )
+        files_before_rip = {
+            path for path in Path(staging_dir).glob("*.mkv") if path.is_file()
+        }
         
-        cmd = [MAKEMKV_CMD, "-r", "--progress=-same", "mkv", f"disc:{drive.mkv_id}", str(track_id), target_dir]
+        cmd = [
+            MAKEMKV_CMD, "-r", "--progress=-same", "mkv",
+            disc_source, str(track_id), staging_dir,
+        ]
         
         log_file = os.path.join(os.path.dirname(jobs[0][1]), "rip.log")
 
@@ -663,6 +815,7 @@ def _rip_jobs_worker(drive, jobs):
             except OSError as error:
                 f.write(f"ERROR: MakeMKV konnte nicht gestartet werden: {error}\n")
                 drive.status = "ERROR (Start)"
+                remove_empty_directory(staging_dir)
                 break
             
             for line in proc.stdout:
@@ -680,15 +833,9 @@ def _rip_jobs_worker(drive, jobs):
 
             if proc.returncode == 0:
                 try:
-                    created_file = os.path.join(target_dir, source_mkv_filename)
-                    if not os.path.exists(created_file):
-                        new_files = set(Path(target_dir).glob("*.mkv")) - files_before_rip
-                        if len(new_files) == 1:
-                            created_file = str(new_files.pop())
-                        else:
-                            raise FileNotFoundError(
-                                f"MakeMKV-Ausgabedatei nicht eindeutig gefunden: {created_file}"
-                            )
+                    created_file = find_created_mkv(
+                        staging_dir, source_mkv_filename, files_before_rip
+                    )
 
                     paths_are_equal = (
                         os.path.normcase(os.path.abspath(created_file))
@@ -721,28 +868,83 @@ def _rip_jobs_worker(drive, jobs):
                 except Exception as e:
                     f.write(f"ERROR: {e}\n")
                     drive.status = "ERROR (Post)"
+                    remove_empty_directory(staging_dir)
                     break 
             else:
                 drive.status = "ERROR (Rip)"
+                f.write(f"Unvollständige Dateien verbleiben in: {staging_dir}\n")
+                remove_empty_directory(staging_dir)
                 break 
 
+        remove_empty_directory(staging_dir)
+
     if not drive.status.startswith("ERROR"):
-        drive.status = "COMPLETED (META WARN)" if metadata_warning else "COMPLETED"
+        final_status = "COMPLETED (META WARN)" if metadata_warning else "COMPLETED"
+        drive.status = "Ejecting..."
         drive.current_job = original_job_name 
+        drive.progress = 0
         eject_drive(drive.device_path)
+        drive.status = final_status
     
     drive.progress = 0
-    time.sleep(3)
 
 
-def rip_jobs_worker(drive, jobs):
+def rip_jobs_worker(drive, jobs, disc_source=None, owns_job_state=False):
     """Keep unexpected filesystem/process errors from leaving a drive busy forever."""
+    disc_source = disc_source or f"disc:{drive.mkv_id}"
     try:
-        _rip_jobs_worker(drive, jobs)
+        _rip_jobs_worker(drive, jobs, disc_source)
     except Exception as error:
         drive.status = "ERROR (Worker)"
         drive.progress = 0
         print(f"Unerwarteter Fehler bei Laufwerk {drive.device_path}: {error}")
+    finally:
+        if owns_job_state:
+            release_output_paths(jobs)
+            with job_state_lock:
+                drive.busy = False
+
+
+def start_rip_jobs(drive, jobs):
+    """Atomically reserve a drive and all outputs before starting its worker."""
+    if not jobs:
+        return None, "Keine Rip-Aufträge vorhanden."
+
+    outputs = [output for _, output, _ in jobs]
+    canonical = [canonical_output_path(output) for output in outputs]
+    with job_state_lock:
+        if drive.busy:
+            return None, f"Laufwerk {drive.mkv_id} ist bereits beschäftigt."
+        duplicate_paths = {path for path in canonical if canonical.count(path) > 1}
+        conflicts = [
+            output for output, normalized in zip(outputs, canonical)
+            if normalized in duplicate_paths
+            or normalized in reserved_outputs
+            or os.path.exists(output)
+        ]
+        if conflicts:
+            return None, "Zieldatei bereits vorhanden oder reserviert:\n  " + "\n  ".join(conflicts)
+
+        reserved_outputs.update(canonical)
+        drive.busy = True
+        drive.status = "Starting..."
+        drive.progress = 0
+        disc_source = f"disc:{drive.mkv_id}"
+
+    try:
+        thread = threading.Thread(
+            target=rip_jobs_worker,
+            args=(drive, jobs, disc_source, True),
+            name=f"rip-{drive.device_path}",
+        )
+        thread.start()
+    except Exception as error:
+        release_output_paths(jobs)
+        with job_state_lock:
+            drive.busy = False
+            drive.status = "ERROR (Start)"
+        return None, f"Worker konnte nicht gestartet werden: {error}"
+    return thread, None
 
 
 def display_width(value):
@@ -787,6 +989,7 @@ def status_text(drive):
         ("Starting", "Startet"),
         ("Ripping", "Rippe"),
         ("Processing", "Verarbeite"),
+        ("Ejecting", "Werfe aus"),
         ("ERROR (Start)", "Fehler · Programmstart"),
         ("ERROR (Rip)", "Fehler · Rip"),
         ("ERROR (Post)", "Fehler · Nachbearbeitung"),
@@ -922,7 +1125,8 @@ def main():
     while True:
         terminal = shutil.get_terminal_size(fallback=(80, 24))
         drive_snapshot = tuple(
-            (d.mkv_id, d.device_path, d.name, d.label, d.status, d.progress, d.current_job)
+            (d.mkv_id, d.device_path, d.name, d.label, d.status,
+             d.progress, d.current_job, d.busy)
             for d in drives
         )
         snapshot = (terminal.columns, terminal.lines, drive_snapshot)
@@ -933,7 +1137,7 @@ def main():
             last_snapshot = snapshot
             force_render = False
 
-        user_input = read_menu_command()
+        user_input = read_menu_command(valid_ids=[drive.mkv_id for drive in drives])
 
         if user_input:
             print()
@@ -971,21 +1175,13 @@ def main():
                     if media_type == 's':
                         jobs = prompt_series_jobs(tracks)
                     else:
-                        longest = max(tracks, key=lambda t: t.get('duration_seconds', 0))
-                        print(f"Selected: {longest.get('duration_str')} ({longest.get('output_filename')})")
-                        m_name = safe_media_name(input("Movie Name: "))
-                        if m_name:
-                            out = os.path.join(BASE_OUTPUT_DIR, m_name, f"{m_name}.mkv")
-                            if os.path.exists(out):
-                                print(f"Abbruch: Zieldatei existiert bereits: {out}")
-                                time.sleep(2)
-                                force_render = True
-                                continue
-                            jobs.append((longest['id'], out, longest.get('output_filename', '')))
+                        jobs = prompt_movie_jobs(tracks)
 
                     if jobs:
-                        t = threading.Thread(target=rip_jobs_worker, args=(selected_drive, jobs))
-                        t.start()
+                        _, start_error = start_rip_jobs(selected_drive, jobs)
+                        if start_error:
+                            print(f"Abbruch: {start_error}")
+                            time.sleep(3)
                     force_render = True
                 else:
                     print("Invalid drive or busy."); time.sleep(1); force_render=True
