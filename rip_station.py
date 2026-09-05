@@ -252,11 +252,10 @@ def rescan_idle_drives():
             new_id, new_name, new_label = info
             drive.mkv_id = new_id
             drive.name = new_name
-            if drive.label != new_label:
-                drive.label = new_label
-                drive.status = "IDLE"
-                drive.current_job = ""
-                drive.media_source = None
+            drive.label = new_label
+            drive.status = "IDLE"
+            drive.current_job = ""
+            drive.media_source = None
         else:
             drive.label = ""
             drive.status = "IDLE"
@@ -994,7 +993,13 @@ def _rip_jobs_worker(drive, jobs, disc_source):
                     break 
             else:
                 drive.status = "ERROR (Rip)"
-                f.write(f"Unvollständige Dateien verbleiben in: {staging_dir}\n")
+                if Path(staging_dir).exists():
+                    f.write(f"Unvollständige Dateien verbleiben in: {staging_dir}\n")
+                else:
+                    f.write(
+                        "MakeMKV wurde mit einem Fehler beendet; "
+                        "keine Teildatei vorhanden.\n"
+                    )
                 remove_empty_directory(staging_dir)
                 break 
 

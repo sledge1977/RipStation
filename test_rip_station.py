@@ -435,6 +435,26 @@ class JobTests(unittest.TestCase):
             rip_station.eject_drive('/dev/sr0')
         self.assertEqual(run.call_args.kwargs['timeout'], 30)
 
+    def test_failed_rip_without_artifact_logs_that_no_partial_file_exists(self):
+        drive = rip_station.Drive(4, '/dev/sr4', 'DISC', 'Drive')
+
+        class FailedProcess:
+            stdout = []
+            returncode = 1
+
+            def wait(self):
+                return self.returncode
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            jobs = [(1, os.path.join(temp_dir, 'Movie.mkv'), 'title.mkv')]
+            with patch('rip_station.subprocess.Popen', return_value=FailedProcess()):
+                rip_station._rip_jobs_worker(drive, jobs, 'dev:/dev/sr4')
+            log = Path(temp_dir, 'rip.log').read_text()
+
+        self.assertIn('keine Teildatei vorhanden', log)
+        self.assertNotIn('Unvollständige Dateien verbleiben', log)
+        self.assertEqual(drive.status, 'ERROR (Rip)')
+
     def test_rescan_does_not_mutate_busy_drive(self):
         drive = rip_station.Drive(2, '/dev/sr2', 'OLD_DISC', 'Old drive')
         drive.busy = True
@@ -449,6 +469,28 @@ class JobTests(unittest.TestCase):
         finally:
             rip_station.drives = original_drives
         self.assertEqual((drive.mkv_id, drive.name, drive.label), (2, 'Old drive', 'OLD_DISC'))
+
+    def test_rescan_resets_idle_drive_even_when_volume_label_is_unchanged(self):
+        drive = rip_station.Drive(0, '/dev/sr0', 'SAME_LABEL', 'Old drive')
+        drive.status = 'COMPLETED'
+        drive.current_job = 'Old.Movie'
+        drive.media_source = 'disc:0'
+        original_drives = rip_station.drives
+        rip_station.drives = [drive]
+        try:
+            with patch('rip_station.fetch_drive_info', return_value=[
+                    (1, 'Updated drive', 'SAME_LABEL', '/dev/sr0')
+                 ]), patch('rip_station.time.sleep'), redirect_stdout(io.StringIO()):
+                rip_station.rescan_idle_drives()
+        finally:
+            rip_station.drives = original_drives
+
+        self.assertEqual((drive.mkv_id, drive.name, drive.label), (
+            1, 'Updated drive', 'SAME_LABEL'
+        ))
+        self.assertEqual(drive.status, 'IDLE')
+        self.assertEqual(drive.current_job, '')
+        self.assertIsNone(drive.media_source)
 
     def test_start_reserves_outputs_and_keeps_source_stable(self):
         entered = rip_station.threading.Event()
