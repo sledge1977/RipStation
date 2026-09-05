@@ -80,6 +80,11 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(rip_station.command_needs_more_digits('1', [1, 10, 12]))
         self.assertFalse(rip_station.command_needs_more_digits('10', [1, 10, 12]))
 
+    def test_progress_uses_overall_value_instead_of_current_operation(self):
+        self.assertEqual(rip_station.parse_progress_line('PRGV:100,450,1000'), 45)
+        self.assertIsNone(rip_station.parse_progress_line('PRGV:100,450,0'))
+        self.assertIsNone(rip_station.parse_progress_line('PRGV:invalid'))
+
 
 class ResponsiveUiTests(unittest.TestCase):
     def setUp(self):
@@ -212,6 +217,15 @@ class SeriesDetectionTests(unittest.TestCase):
             track(3, 1500, 3),
         ]
         self.assertEqual([t['id'] for t in rip_station.order_episode_tracks(tracks)], [3, 7])
+
+    def test_generic_markers_follow_episode_from_single_known_season(self):
+        tracks = [
+            track(2, 1500, 2, title_name='Episode 6'),
+            track(5, 1500, 3, title_name='Episode 7'),
+            track(8, 1500, 1, title_name='Show S03E05'),
+        ]
+        ordered = rip_station.order_episode_tracks(tracks)
+        self.assertEqual([item['id'] for item in ordered], [8, 2, 5])
 
 
 class JobTests(unittest.TestCase):

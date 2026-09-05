@@ -523,17 +523,48 @@ def order_episode_tracks(tracks):
     """Use explicit episode markers only when they are complete and unambiguous."""
     tracks = list(tracks)
     identities = [extract_episode_info(track) for track in tracks]
-    if identities and all(episode is not None for _, episode in identities):
-        if len(set(identities)) == len(identities):
-            return sorted(
-                tracks,
-                key=lambda track: (
-                    extract_episode_info(track)[0]
-                    if extract_episode_info(track)[0] is not None else -1,
-                    extract_episode_info(track)[1],
+    if not identities or not all(episode is not None for _, episode in identities):
+        return sorted(tracks, key=lambda track: track['id'])
+
+    seasons = {season for season, _ in identities if season is not None}
+    episode_numbers = [episode for _, episode in identities]
+    if len(seasons) <= 1 and len(set(episode_numbers)) == len(episode_numbers):
+        return [
+            track
+            for _, track in sorted(
+                zip(identities, tracks),
+                key=lambda item: item[0][1],
+            )
+        ]
+
+    if len(set(identities)) == len(identities):
+        return [
+            track
+            for _, track in sorted(
+                zip(identities, tracks),
+                key=lambda item: (
+                    item[0][0] if item[0][0] is not None else -1,
+                    item[0][1],
                 ),
             )
+        ]
     return sorted(tracks, key=lambda track: track['id'])
+
+
+def parse_progress_line(line):
+    """Return MakeMKV's overall PRGV progress as a percentage."""
+    if not line.startswith("PRGV:"):
+        return None
+    try:
+        _current, total, maximum = map(
+            int,
+            line.split(":", 1)[1].strip().split(",")[:3],
+        )
+        if maximum <= 0:
+            return None
+        return max(0, min(100, int((total / maximum) * 100)))
+    except (ValueError, IndexError):
+        return None
 
 
 def format_number_ranges(numbers):
@@ -910,13 +941,9 @@ def _rip_jobs_worker(drive, jobs, disc_source):
 
                 for line in proc.stdout:
                     f.write(line)
-                    if line.startswith("PRGV:"):
-                        try:
-                            parts = line.split(":")[1].strip().split(",")
-                            current, total = int(parts[0]), int(parts[2])
-                            drive.progress = int((current / total) * 100)
-                        except (ValueError, IndexError, ZeroDivisionError):
-                            pass
+                    progress = parse_progress_line(line)
+                    if progress is not None:
+                        drive.progress = progress
 
                 proc.wait()
             finally:
