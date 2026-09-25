@@ -82,6 +82,22 @@ def remove_empty_directory(path: str) -> None:
         pass
 
 
+def move_without_overwrite(source: str, destination: str) -> None:
+    """Publish a staged file without replacing a destination created meanwhile."""
+    try:
+        if os.name == "nt":
+            # Windows rename fails when the destination already exists.
+            os.rename(source, destination)
+        else:
+            # Staging is inside the destination directory, so both paths share a FS.
+            os.link(source, destination)
+            os.unlink(source)
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"Zieldatei existiert bereits, wird nicht überschrieben: {destination}"
+        ) from error
+
+
 def ensure_process_stopped(proc: Optional[subprocess.Popen], timeout: int = 10) -> None:
     """Terminate and, if necessary, kill a child that did not exit normally."""
     if proc is None or getattr(proc, "returncode", None) is not None:
@@ -131,7 +147,6 @@ def _rip_jobs_worker(
 
     drive.status = "Starting..."
     drive.progress = 0
-    drive.cancel_requested = False
     total_jobs = len(jobs)
     metadata_warning = False
     first_job_stem = os.path.splitext(
@@ -187,7 +202,11 @@ def _rip_jobs_worker(
                         bufsize=1,
                         creationflags=creation_flags,
                     )
-                    drive.active_process = proc
+                    with job_state_lock:
+                        drive.active_process = proc
+                        cancelled = drive.cancel_requested
+                    if cancelled:
+                        ensure_process_stopped(proc)
                 except OSError as error:
                     f.write(f"ERROR: MakeMKV konnte nicht gestartet werden: {error}\n")
                     drive.status = "ERROR (Start)"
@@ -205,7 +224,8 @@ def _rip_jobs_worker(
 
                 proc.wait()
             finally:
-                drive.active_process = None
+                with job_state_lock:
+                    drive.active_process = None
                 ensure_process_stopped(proc)
                 remove_empty_directory(staging_dir)
 
@@ -223,16 +243,7 @@ def _rip_jobs_worker(
                         staging_dir, source_mkv_filename, files_before_rip
                     )
 
-                    paths_are_equal = os.path.normcase(
-                        os.path.abspath(created_file)
-                    ) == os.path.normcase(os.path.abspath(final_output_path))
-                    if os.path.exists(final_output_path) and not paths_are_equal:
-                        raise FileExistsError(
-                            f"Zieldatei existiert bereits, wird nicht überschrieben: {final_output_path}"
-                        )
-
-                    if not paths_are_equal:
-                        os.rename(created_file, final_output_path)
+                    move_without_overwrite(created_file, final_output_path)
 
                     # Metadata title (via mkvpropedit)
                     try:

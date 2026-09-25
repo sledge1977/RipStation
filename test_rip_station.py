@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import rip_station
+from ripstation import prompts as package_prompts
+from ripstation import worker as package_worker
 
 
 def track(track_id, duration, size, **extra):
@@ -332,6 +334,107 @@ class JobTests(unittest.TestCase):
             )
         self.assertEqual(drive.status, "ERROR (Worker)")
         self.assertEqual(drive.progress, 0)
+
+    def test_quit_with_idle_drive_returns(self):
+        drive = rip_station.Drive(0, "/dev/sr0", "DISC", "Drive")
+        with (
+            patch.object(rip_station, "drives", [drive]),
+            patch.object(rip_station, "job_state_lock", rip_station.threading.Lock()),
+            patch("rip_station.scan_drives"),
+            patch("rip_station.print_ui"),
+            patch("rip_station.read_menu_command", return_value="q"),
+            redirect_stdout(io.StringIO()),
+        ):
+            thread = rip_station.threading.Thread(
+                target=rip_station.main, args=([],), daemon=True
+            )
+            thread.start()
+            thread.join(1)
+            self.assertFalse(thread.is_alive(), "Beenden hängt bei erkanntem Laufwerk")
+
+    def test_cancellation_before_worker_runs_is_preserved(self):
+        for worker in (rip_station._rip_jobs_worker, package_worker._rip_jobs_worker):
+            with self.subTest(worker=worker.__module__):
+                drive = rip_station.Drive(0, "/dev/sr0", "DISC", "Drive")
+                drive.cancel_requested = True
+                with patch("subprocess.Popen") as popen:
+                    worker(drive, [(0, "/unused/Movie.mkv", "")], "dev:/dev/sr0")
+                popen.assert_not_called()
+                self.assertEqual(drive.status, "CANCELLED")
+
+    def test_cancellation_during_process_launch_stops_process(self):
+        for worker, cancel in (
+            (rip_station._rip_jobs_worker, rip_station.cancel_drive_rip),
+            (package_worker._rip_jobs_worker, package_worker.cancel_drive_rip),
+        ):
+            with (
+                self.subTest(worker=worker.__module__),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                drive = rip_station.Drive(0, "/dev/sr0", "DISC", "Drive")
+                drive.busy = True
+
+                class Process:
+                    stdout = []
+                    returncode = None
+                    terminated = False
+
+                    def poll(self):
+                        return self.returncode
+
+                    def terminate(self):
+                        self.terminated = True
+                        self.returncode = -15
+
+                    def wait(self, timeout=None):
+                        return self.returncode
+
+                process = Process()
+
+                def launch(_command, **_kwargs):
+                    self.assertTrue(cancel(drive))
+                    return process
+
+                output = os.path.join(temp_dir, "Movie.mkv")
+                with patch("subprocess.Popen", side_effect=launch):
+                    worker(drive, [(0, output, "")], "dev:/dev/sr0")
+                self.assertTrue(process.terminated)
+                self.assertEqual(drive.status, "CANCELLED")
+
+    def test_staged_file_never_replaces_existing_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir, "source.mkv")
+            target = Path(temp_dir, "target.mkv")
+            source.write_bytes(b"new")
+            target.write_bytes(b"original")
+            with self.assertRaises(FileExistsError):
+                package_worker.move_without_overwrite(str(source), str(target))
+            self.assertEqual(target.read_bytes(), b"original")
+            self.assertEqual(source.read_bytes(), b"new")
+
+    def test_package_prompt_skips_reserved_episode_numbers(self):
+        tracks = [track(1, 1500, 1), track(2, 1530, 2)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            reserved = Path(temp_dir, "Show", "Season 01", "Show.S01E04.mkv")
+            reserved_path = package_worker.canonical_output_path(reserved)
+            with package_worker.job_state_lock:
+                package_worker.reserved_outputs.add(reserved_path)
+            try:
+                answers = iter(["", "", "Show", "", ""])
+                with (
+                    patch("builtins.input", side_effect=lambda _="": next(answers)),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    jobs = package_prompts.prompt_series_jobs(
+                        tracks, base_output_dir=temp_dir
+                    )
+            finally:
+                with package_worker.job_state_lock:
+                    package_worker.reserved_outputs.discard(reserved_path)
+        self.assertEqual(
+            [Path(job[1]).name for job in jobs],
+            ["Show.S01E05.mkv", "Show.S01E06.mkv"],
+        )
 
     def test_windows_reserved_names_are_prefixed(self):
         for value in ("CON", "prn", "AUX.txt", "NUL", "COM1", "lpt9"):

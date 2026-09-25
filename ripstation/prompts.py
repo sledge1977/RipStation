@@ -17,6 +17,7 @@ from ripstation.analyzer import (
 from ripstation.config import BASE_OUTPUT_DIR
 from ripstation.models import SeriesAnalysis
 from ripstation.ui import fit_text, table_row
+from ripstation.worker import job_state_lock, reserved_outputs
 
 
 def prompt_integer(
@@ -208,7 +209,11 @@ def prompt_series_jobs(
     inferred_episodes = [extract_episode_info(track)[1] for track in selected_tracks]
     if not all(number is not None for number in inferred_episodes):
         episode_start = next_episode_number(
-            raw_name, season_number, base_output_dir=base_dir
+            raw_name,
+            season_number,
+            base_output_dir=base_dir,
+            reserved_outputs=reserved_outputs,
+            job_state_lock=job_state_lock,
         )
         inferred_episodes = list(
             range(episode_start, episode_start + len(selected_tracks))

@@ -78,6 +78,7 @@ from ripstation.worker import (
 from ripstation.worker import (
     ensure_process_stopped,
     find_created_mkv,
+    move_without_overwrite,
     parse_progress_line,
     remove_empty_directory,
 )
@@ -332,7 +333,6 @@ def _rip_jobs_worker(
 ) -> None:
     drive.status = "Starting..."
     drive.progress = 0
-    drive.cancel_requested = False
     total_jobs = len(jobs)
     metadata_warning = False
     first_job_stem = os.path.splitext(
@@ -388,7 +388,11 @@ def _rip_jobs_worker(
                         bufsize=1,
                         creationflags=creation_flags,
                     )
-                    drive.active_process = proc
+                    with job_state_lock:
+                        drive.active_process = proc
+                        cancelled = drive.cancel_requested
+                    if cancelled:
+                        ensure_process_stopped(proc)
                 except OSError as error:
                     f.write(f"ERROR: MakeMKV konnte nicht gestartet werden: {error}\n")
                     drive.status = "ERROR (Start)"
@@ -406,7 +410,8 @@ def _rip_jobs_worker(
 
                 proc.wait()
             finally:
-                drive.active_process = None
+                with job_state_lock:
+                    drive.active_process = None
                 ensure_process_stopped(proc)
                 remove_empty_directory(staging_dir)
 
@@ -424,16 +429,7 @@ def _rip_jobs_worker(
                         staging_dir, source_mkv_filename, files_before_rip
                     )
 
-                    paths_are_equal = os.path.normcase(
-                        os.path.abspath(created_file)
-                    ) == os.path.normcase(os.path.abspath(final_output_path))
-                    if os.path.exists(final_output_path) and not paths_are_equal:
-                        raise FileExistsError(
-                            f"Zieldatei existiert bereits, wird nicht überschrieben: {final_output_path}"
-                        )
-
-                    if not paths_are_equal:
-                        os.rename(created_file, final_output_path)
+                    move_without_overwrite(created_file, final_output_path)
 
                     # Metadata title (via MKVPROPEDIT_CMD)
                     try:
@@ -850,7 +846,7 @@ def main(args: Optional[List[str]] = None) -> None:
 
             if user_input.lower() == "q":
                 with job_state_lock:
-                    active_any = any(not drive_is_available(d) for d in drives)
+                    active_any = any(d.busy for d in drives)
                 if active_any:
                     print(
                         "Ein Rip läuft noch; Beenden ist erst danach möglich (oder 'c' zum Abbrechen)."
