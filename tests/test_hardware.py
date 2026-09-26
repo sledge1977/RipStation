@@ -69,7 +69,10 @@ class DriveScanTests(unittest.TestCase):
 
 class EjectTests(unittest.TestCase):
     def test_eject_has_timeout(self):
-        with patch("subprocess.run") as run:
+        with (
+            patch("ripstation.hardware.os.name", "posix"),
+            patch("subprocess.run") as run,
+        ):
             self.assertIsNone(hardware.eject_drive("/dev/sr0"))
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
