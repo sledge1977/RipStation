@@ -23,3 +23,10 @@ pip-delete-this-directory.txt
 
 # pyenv
 .python-version
+
+# Tooling / packaging
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/

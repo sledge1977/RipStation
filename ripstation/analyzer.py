@@ -1,17 +1,17 @@
 import csv
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
 from ripstation.config import (
-    BASE_OUTPUT_DIR,
     SERIES_MIN_LENGTH_SECONDS,
     SERIES_TYPICAL_MAX_SECONDS,
     SERIES_TYPICAL_MIN_SECONDS,
 )
-from ripstation.models import SeriesAnalysis
+from ripstation.models import RipJob, SeriesAnalysis, Track
 
 EPISODE_PATTERNS = (
     re.compile(
@@ -38,9 +38,19 @@ def parse_duration_to_seconds(duration_str: str) -> int:
     return 0
 
 
-def parse_tinfo_output(output: str) -> List[Dict[str, Any]]:
-    """Parse MakeMKV robot-mode TINFO lines into track dictionaries."""
-    tracks: Dict[int, Dict[str, Any]] = {}
+TINFO_FIELDS = {
+    2: "title_name",
+    9: "duration_str",
+    10: "size_str",
+    11: "size_bytes",
+    16: "source_filename",
+    27: "output_filename",
+}
+
+
+def parse_tinfo_output(output: str) -> list[Track]:
+    """Parse MakeMKV robot-mode TINFO lines into tracks."""
+    tracks: dict[int, dict[str, Any]] = {}
     for line in output.splitlines():
         if not line.startswith("TINFO:"):
             continue
@@ -51,29 +61,22 @@ def parse_tinfo_output(output: str) -> List[Dict[str, Any]]:
             track_id = int(row[0])
             attribute_id = int(row[1])
             value = row[3]
-            track = tracks.setdefault(track_id, {"id": track_id})
-
-            if attribute_id == 2:
-                track["title_name"] = value
-            elif attribute_id == 9:
-                track["duration_str"] = value
-                track["duration_seconds"] = parse_duration_to_seconds(value)
-            elif attribute_id == 10:
-                track["size_str"] = value
-            elif attribute_id == 11:
-                track["size_bytes"] = int(value)
-            elif attribute_id == 16:
-                track["source_filename"] = value
-            elif attribute_id == 27:
-                track["output_filename"] = value
+            fields = tracks.setdefault(track_id, {"id": track_id})
+            field = TINFO_FIELDS.get(attribute_id)
+            if field == "size_bytes":
+                fields[field] = int(value)
+            elif field:
+                fields[field] = value
+            if field == "duration_str":
+                fields["duration_seconds"] = parse_duration_to_seconds(value)
         except (IndexError, ValueError, csv.Error):
             continue
-    return sorted(tracks.values(), key=lambda t: t["id"])
+    return [Track(**tracks[track_id]) for track_id in sorted(tracks)]
 
 
-def parse_track_selection(selection_str: str) -> List[int]:
-    selection: List[int] = []
-    seen: Set[int] = set()
+def parse_track_selection(selection_str: str) -> list[int]:
+    selection: list[int] = []
+    seen: set[int] = set()
     selection_str = "".join(selection_str.split())
     if not selection_str:
         return []
@@ -84,7 +87,7 @@ def parse_track_selection(selection_str: str) -> List[int]:
             if "-" in part:
                 start, end = map(int, part.split("-"))
                 step = 1 if end >= start else -1
-                values = range(start, end + step, step)
+                values: Iterable[int] = range(start, end + step, step)
             else:
                 values = [int(part)]
             for value in values:
@@ -161,11 +164,9 @@ def canonical_output_path(path: Any) -> str:
     return os.path.normcase(os.path.abspath(os.fspath(path)))
 
 
-def extract_episode_info(track: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+def extract_episode_info(track: Track) -> tuple[int | None, int | None]:
     """Return (season, episode) if a track label contains an explicit marker."""
-    fields = ("title_name", "source_filename", "output_filename")
-    for field in fields:
-        text = track.get(field, "")
+    for text in (track.title_name, track.source_filename, track.output_filename):
         for pattern in EPISODE_PATTERNS:
             match = pattern.search(text)
             if match:
@@ -174,15 +175,15 @@ def extract_episode_info(track: Dict[str, Any]) -> Tuple[Optional[int], Optional
     return (None, None)
 
 
-def _duration_clusters(tracks: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+def _duration_clusters(tracks: list[Track]) -> list[list[Track]]:
     """Group tracks with episode-like, similar runtimes."""
-    clusters: List[List[Dict[str, Any]]] = []
-    for track in sorted(tracks, key=lambda t: t.get("duration_seconds", 0)):
-        duration = track.get("duration_seconds", 0)
+    clusters: list[list[Track]] = []
+    for track in sorted(tracks, key=lambda t: t.duration_seconds):
+        duration = track.duration_seconds
         best_cluster = None
         best_distance = None
         for cluster in clusters:
-            center = median(t["duration_seconds"] for t in cluster)
+            center = median(t.duration_seconds for t in cluster)
             tolerance = max(120, center * 0.12)
             distance = abs(duration - center)
             if distance <= tolerance and (
@@ -197,12 +198,12 @@ def _duration_clusters(tracks: List[Dict[str, Any]]) -> List[List[Dict[str, Any]
     return clusters
 
 
-def order_episode_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def order_episode_tracks(tracks: list[Track]) -> list[Track]:
     """Use explicit episode markers only when they are complete and unambiguous."""
     tracks_list = list(tracks)
     identities = [extract_episode_info(track) for track in tracks_list]
     if not identities or not all(episode is not None for _, episode in identities):
-        return sorted(tracks_list, key=lambda track: track["id"])
+        return sorted(tracks_list, key=lambda track: track.id)
 
     seasons = {season for season, _ in identities if season is not None}
     episode_numbers = [episode for _, episode in identities]
@@ -210,8 +211,8 @@ def order_episode_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [
             track
             for _, track in sorted(
-                zip(identities, tracks_list),
-                key=lambda item: item[0][1],
+                zip(identities, tracks_list, strict=True),
+                key=lambda item: item[0][1] or 0,
             )
         ]
 
@@ -219,36 +220,34 @@ def order_episode_tracks(tracks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return [
             track
             for _, track in sorted(
-                zip(identities, tracks_list),
+                zip(identities, tracks_list, strict=True),
                 key=lambda item: (
                     item[0][0] if item[0][0] is not None else -1,
                     item[0][1],
                 ),
             )
         ]
-    return sorted(tracks_list, key=lambda track: track["id"])
+    return sorted(tracks_list, key=lambda track: track.id)
 
 
-def analyze_series_tracks(tracks: List[Dict[str, Any]]) -> SeriesAnalysis:
+def analyze_series_tracks(tracks: list[Track]) -> SeriesAnalysis:
     """Recommend probable episode tracks while keeping the decision visible."""
     eligible = [
-        track
-        for track in tracks
-        if track.get("duration_seconds", 0) >= SERIES_MIN_LENGTH_SECONDS
+        track for track in tracks if track.duration_seconds >= SERIES_MIN_LENGTH_SECONDS
     ]
     forced_low_confidence = False
     if not eligible:
-        eligible = [track for track in tracks if track.get("duration_seconds", 0) > 0]
+        eligible = [track for track in tracks if track.duration_seconds > 0]
         forced_low_confidence = True
     if not eligible:
         return SeriesAnalysis([], {}, "niedrig", 0)
 
     unique_tracks = []
-    fingerprints: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
-    duplicate_of: Dict[int, int] = {}
-    for track in sorted(eligible, key=lambda t: t["id"]):
-        size = track.get("size_bytes", 0)
-        fingerprint = (track.get("duration_seconds", 0), size) if size else None
+    fingerprints: dict[tuple[int, int], list[Track]] = {}
+    duplicate_of: dict[int, int] = {}
+    for track in sorted(eligible, key=lambda t: t.id):
+        size = track.size_bytes
+        fingerprint = (track.duration_seconds, size) if size else None
         matching_tracks = fingerprints.get(fingerprint, []) if fingerprint else []
         if matching_tracks:
             current_identity = extract_episode_info(track)
@@ -261,9 +260,7 @@ def analyze_series_tracks(tracks: List[Dict[str, Any]]) -> SeriesAnalysis:
                 None,
             )
             if current_identity[1] is None or matching_episode is not None:
-                duplicate_of[track["id"]] = (matching_episode or matching_tracks[0])[
-                    "id"
-                ]
+                duplicate_of[track.id] = (matching_episode or matching_tracks[0]).id
             else:
                 unique_tracks.append(track)
                 matching_tracks.append(track)
@@ -297,9 +294,9 @@ def analyze_series_tracks(tracks: List[Dict[str, Any]]) -> SeriesAnalysis:
             key=lambda season: (-len(tracks_by_season[season]), season),
         )
         best_season_tracks = order_episode_tracks(tracks_by_season[selected_season])
-        center = int(median(track["duration_seconds"] for track in best_season_tracks))
+        center = int(median(track.duration_seconds for track in best_season_tracks))
         return SeriesAnalysis(
-            [track["id"] for track in best_season_tracks],
+            [track.id for track in best_season_tracks],
             duplicate_of,
             "niedrig",
             center,
@@ -308,22 +305,22 @@ def analyze_series_tracks(tracks: List[Dict[str, Any]]) -> SeriesAnalysis:
     if len(explicitly_numbered) >= 2 and len(set(explicit_identities)) == len(
         explicit_identities
     ):
-        center = int(median(track["duration_seconds"] for track in explicitly_numbered))
+        center = int(median(track.duration_seconds for track in explicitly_numbered))
         confidence = (
             "hoch" if len(explicitly_numbered) == len(unique_tracks) else "mittel"
         )
         ordered = order_episode_tracks(explicitly_numbered)
         return SeriesAnalysis(
-            [track["id"] for track in ordered], duplicate_of, confidence, center
+            [track.id for track in ordered], duplicate_of, confidence, center
         )
 
-    def cluster_score(cluster: List[Dict[str, Any]]) -> Tuple[bool, int, float]:
-        center = median(t["duration_seconds"] for t in cluster)
+    def cluster_score(cluster: list[Track]) -> tuple[bool, int, float]:
+        center = median(t.duration_seconds for t in cluster)
         typical = SERIES_TYPICAL_MIN_SECONDS <= center <= SERIES_TYPICAL_MAX_SECONDS
         return (typical, len(cluster), center)
 
     best = max(clusters, key=cluster_score)
-    best_center = int(median(t["duration_seconds"] for t in best))
+    best_center = int(median(t.duration_seconds for t in best))
     share = len(best) / max(1, len(unique_tracks))
     if forced_low_confidence:
         confidence = "niedrig"
@@ -336,47 +333,45 @@ def analyze_series_tracks(tracks: List[Dict[str, Any]]) -> SeriesAnalysis:
 
     ordered = order_episode_tracks(best)
     return SeriesAnalysis(
-        [track["id"] for track in ordered], duplicate_of, confidence, best_center
+        [track.id for track in ordered], duplicate_of, confidence, best_center
     )
 
 
 def build_series_jobs(
     series_name: str,
     season_number: int,
-    tracks: List[Dict[str, Any]],
-    episode_numbers: List[int],
-    base_output_dir: Optional[str] = None,
-) -> List[Tuple[int, str, str]]:
+    tracks: list[Track],
+    episode_numbers: list[int],
+    base_output_dir: str,
+) -> list[RipJob]:
     if len(tracks) != len(episode_numbers):
         raise ValueError("Track- und Folgennummern müssen gleich lang sein")
     safe_name = safe_media_name(series_name)
     if not safe_name:
         raise ValueError("Der Serienname darf nicht leer sein")
-    base_dir = base_output_dir or BASE_OUTPUT_DIR
     jobs = []
-    for track, episode_number in zip(tracks, episode_numbers):
+    for track, episode_number in zip(tracks, episode_numbers, strict=True):
         filename = f"{safe_name}.S{season_number:02d}E{episode_number:02d}.mkv"
         output = os.path.join(
-            base_dir, safe_name, f"Season {season_number:02d}", filename
+            base_output_dir, safe_name, f"Season {season_number:02d}", filename
         )
-        jobs.append((track["id"], output, track.get("output_filename", "")))
+        jobs.append(RipJob(track.id, output, track.output_filename))
     return jobs
 
 
 def next_episode_number(
     series_name: str,
     season_number: int,
-    base_output_dir: Optional[str] = None,
-    reserved_outputs: Optional[Set[str]] = None,
+    base_output_dir: str,
+    reserved_outputs: set[str] | None = None,
     job_state_lock: Any = None,
 ) -> int:
     """Continue after existing and currently reserved episodes."""
     safe_name = safe_media_name(series_name)
-    base_dir = base_output_dir or BASE_OUTPUT_DIR
-    season_dir = Path(base_dir) / safe_name / f"Season {season_number:02d}"
+    season_dir = Path(base_output_dir) / safe_name / f"Season {season_number:02d}"
     # Improved regex: supports dot, space, dash, or underscore before S01E01
     pattern = re.compile(rf"(?i)(?:^|[ ._-])S{season_number:02d}E(\d+)")
-    existing_numbers: List[int] = []
+    existing_numbers: list[int] = []
     canonical_season_dir = canonical_output_path(season_dir)
 
     def scan_files():

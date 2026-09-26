@@ -1,15 +1,14 @@
 import csv
 import os
 import subprocess
-from typing import List, Optional, Tuple
 
 from ripstation.analyzer import parse_tinfo_output
-from ripstation.config import detect_makemkv_cmd
-from ripstation.models import Drive
+from ripstation.models import Drive, Track
+from ripstation.process import CREATE_NO_WINDOW, OUTPUT_ENCODING
 
 
-def eject_drive(device_path: str) -> None:
-    """Eject the optical drive according to the operating system."""
+def eject_drive(device_path: str) -> str | None:
+    """Eject the optical drive; returns a user-facing note if that failed."""
     try:
         if os.name == "nt":
             # Use PowerShell COM object on Windows
@@ -22,27 +21,24 @@ def eject_drive(device_path: str) -> None:
                 f"$cd = $wm.cdromCollection.getByDriveSpecifier('{clean_dev}'); "
                 f"if ($cd) {{ $cd.Eject() }} else {{ exit 1 }}"
             )
-            creation_flags = 0x08000000  # CREATE_NO_WINDOW
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 capture_output=True,
                 timeout=15,
-                creationflags=creation_flags,
+                creationflags=CREATE_NO_WINDOW,
             )
-            if result.returncode == 0:
-                print(f"Laufwerk {clean_dev} ausgeworfen.")
-            else:
-                print(f"Hinweis: Bitte Laufwerk {device_path} manuell auswerfen.")
+            if result.returncode != 0:
+                return "Bitte manuell auswerfen"
         else:
             subprocess.run(
                 ["eject", device_path], check=True, capture_output=True, timeout=30
             )
-            print(f"Laufwerk {device_path} ausgeworfen.")
-    except Exception as e:
-        print(f"Fehler beim Auswerfen ({device_path}): {e}")
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"Auswerfen fehlgeschlagen: {error}"
+    return None
 
 
-def drive_source_candidates(drive: Drive) -> List[str]:
+def drive_source_candidates(drive: Drive) -> list[str]:
     """Prefer the physical device and retain disc ID as a compatibility fallback."""
     candidates = []
     if drive.device_path:
@@ -51,79 +47,73 @@ def drive_source_candidates(drive: Drive) -> List[str]:
     return list(dict.fromkeys(candidates))
 
 
-def fetch_drive_info(
-    makemkv_cmd: Optional[str] = None,
-) -> List[Tuple[int, str, str, str]]:
+def parse_drive_lines(output: str) -> list[tuple[int, str, str, str]]:
+    """Parse DRV lines into (id, name, label, device); malformed lines are skipped."""
+    drives_info: list[tuple[int, str, str, str]] = []
+    for line in output.splitlines():
+        if not line.startswith("DRV:"):
+            continue
+        try:
+            row = next(csv.reader([line[4:]]))
+            if len(row) < 7 or not row[6]:
+                continue
+            drives_info.append((int(row[0]), row[4][:14], row[5], row[6]))
+        except (ValueError, csv.Error, StopIteration):
+            continue
+    return drives_info
+
+
+def fetch_drive_info(makemkv_cmd: str) -> list[tuple[int, str, str, str]]:
     """Runs makemkvcon once and returns parsed drive tuples (id, name, label, dev)."""
-    cmd_name = makemkv_cmd or detect_makemkv_cmd()
     try:
-        cmd = [cmd_name, "-r", "--cache=1", "info", "disc:9999"]
-        creation_flags = 0x08000000 if os.name == "nt" else 0
         result = subprocess.run(
-            cmd,
+            [makemkv_cmd, "-r", "--cache=1", "info", "disc:9999"],
             capture_output=True,
-            text=True,
             check=True,
             timeout=120,
-            creationflags=creation_flags,
+            creationflags=CREATE_NO_WINDOW,
+            encoding=OUTPUT_ENCODING,
+            errors="replace",
         )
     except (
         subprocess.CalledProcessError,
         subprocess.TimeoutExpired,
-        FileNotFoundError,
+        OSError,
     ) as e:
         raise RuntimeError(
-            f"makemkvcon konnte nicht ausgeführt werden ({cmd_name}): {e}"
+            f"makemkvcon konnte nicht ausgeführt werden ({makemkv_cmd}): {e}"
         ) from e
-
-    drives_info: List[Tuple[int, str, str, str]] = []
-    for line in result.stdout.splitlines():
-        if line.startswith("DRV:"):
-            clean_line = line[4:]
-            reader = csv.reader([clean_line])
-            row = list(reader)[0]
-
-            if len(row) >= 6:
-                d_id = int(row[0])
-                d_name = row[4][:14]
-                d_label = row[5]
-                d_dev = row[6] if len(row) >= 7 else ""
-                if d_dev:
-                    drives_info.append((d_id, d_name, d_label, d_dev))
-    return drives_info
+    return parse_drive_lines(result.stdout)
 
 
 def get_disc_tracks(
-    drive: Drive, min_len_seconds: int, makemkv_cmd: Optional[str] = None
-) -> list:
-    cmd_name = makemkv_cmd or detect_makemkv_cmd()
-    creation_flags = 0x08000000 if os.name == "nt" else 0
+    drive: Drive, min_len_seconds: int, makemkv_cmd: str
+) -> list[Track]:
     errors = []
     for source in drive_source_candidates(drive):
-        cmd = [cmd_name, "-r", "--cache=1", "info", source]
         try:
             result = subprocess.run(
-                cmd,
+                [makemkv_cmd, "-r", "--cache=1", "info", source],
                 capture_output=True,
-                text=True,
                 check=True,
                 timeout=600,
-                creationflags=creation_flags,
+                creationflags=CREATE_NO_WINDOW,
+                encoding=OUTPUT_ENCODING,
+                errors="replace",
             )
         except (
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
-            FileNotFoundError,
+            OSError,
         ) as error:
             errors.append(f"{source}: {error}")
             continue
 
         drive.media_source = source
-        tracks = parse_tinfo_output(result.stdout)
         return [
             track
-            for track in tracks
-            if track.get("duration_seconds", 0) >= min_len_seconds
+            for track in parse_tinfo_output(result.stdout)
+            if track.duration_seconds >= min_len_seconds
         ]
 
     print("Trackscan fehlgeschlagen: " + "; ".join(errors))

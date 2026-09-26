@@ -3,7 +3,6 @@ import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 
 def detect_makemkv_cmd() -> str:
@@ -51,8 +50,6 @@ def default_output_dir() -> str:
     return os.path.join(str(Path.home()), "Videos")
 
 
-BASE_OUTPUT_DIR = default_output_dir()
-
 MOVIE_MIN_LENGTH_SECONDS = 60 * 60
 SERIES_SCAN_MIN_LENGTH_SECONDS = 60
 SERIES_MIN_LENGTH_SECONDS = 8 * 60
@@ -70,7 +67,7 @@ class Config:
     series_scan_min_seconds: int = SERIES_SCAN_MIN_LENGTH_SECONDS
 
 
-def parse_arguments(args: Optional[List[str]] = None) -> Config:
+def parse_arguments(args: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         description="RipStation - Multi-Laufwerk Ripping Station für Filme & Serien",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,

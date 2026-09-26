@@ -1,31 +1,26 @@
 import os
 import shutil
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 
 from ripstation.analyzer import (
     analyze_series_tracks,
     build_series_jobs,
-    canonical_output_path,
     extract_episode_info,
     format_number_ranges,
-    next_episode_number,
     order_episode_tracks,
     parse_track_selection,
     safe_media_name,
 )
-from ripstation.config import BASE_OUTPUT_DIR
-from ripstation.models import SeriesAnalysis
+from ripstation.models import RipJob, SeriesAnalysis, Track
+from ripstation.station import Station
 from ripstation.ui import fit_text, table_row
-from ripstation.worker import job_state_lock, reserved_outputs
 
 
 def prompt_integer(
     prompt: str,
-    default: Optional[int] = None,
+    default: int | None = None,
     minimum: int = 0,
     allow_cancel: bool = True,
-) -> Optional[int]:
+) -> int | None:
     while True:
         suffix = f" [{default}]" if default is not None else ""
         value = input(f"{prompt}{suffix}: ").strip()
@@ -43,25 +38,21 @@ def prompt_integer(
 
 
 def render_series_tracks(
-    tracks: List[Dict[str, Any]], analysis: SeriesAnalysis, width: Optional[int] = None
+    tracks: list[Track], analysis: SeriesAnalysis, width: int | None = None
 ) -> str:
     """Render the episode candidate list without exceeding terminal width."""
     terminal_width = shutil.get_terminal_size(fallback=(80, 24)).columns
     width = max(20, width if width is not None else terminal_width)
     recommended = analysis.recommended_ids
 
-    def marker_for(track):
-        if track["id"] in analysis.duplicate_of:
-            return f"~{analysis.duplicate_of[track['id']]}"
-        return "*" if track["id"] in recommended else ""
+    def marker_for(track: Track) -> str:
+        if track.id in analysis.duplicate_of:
+            return f"~{analysis.duplicate_of[track.id]}"
+        return "*" if track.id in recommended else ""
 
-    def source_for(track):
-        parts = [
-            track.get(field)
-            for field in ("source_filename", "title_name")
-            if track.get(field)
-        ]
-        return " | ".join(parts) or track.get("output_filename", "")
+    def source_for(track: Track) -> str:
+        parts = [part for part in (track.source_filename, track.title_name) if part]
+        return " | ".join(parts) or track.output_filename
 
     lines = []
     if width >= 76:
@@ -75,9 +66,9 @@ def render_series_tracks(
                 table_row(
                     [
                         marker_for(track),
-                        track["id"],
-                        track.get("duration_str", "?"),
-                        track.get("size_str", "?"),
+                        track.id,
+                        track.duration_str or "?",
+                        track.size_str or "?",
                         source_for(track),
                     ],
                     widths,
@@ -92,8 +83,8 @@ def render_series_tracks(
                 table_row(
                     [
                         marker_for(track),
-                        track["id"],
-                        track.get("duration_str", "?"),
+                        track.id,
+                        track.duration_str or "?",
                         source_for(track),
                     ],
                     widths,
@@ -102,8 +93,8 @@ def render_series_tracks(
     else:
         for track in tracks:
             heading = (
-                f"{marker_for(track):>3} [{track['id']}] "
-                f"{track.get('duration_str', '?')} · {track.get('size_str', '?')}"
+                f"{marker_for(track):>3} [{track.id}] "
+                f"{track.duration_str or '?'} · {track.size_str or '?'}"
             )
             lines.extend(
                 (fit_text(heading, width), fit_text(f"    {source_for(track)}", width))
@@ -112,10 +103,8 @@ def render_series_tracks(
 
 
 def prompt_series_jobs(
-    tracks: List[Dict[str, Any]],
-    default_name: str = "",
-    base_output_dir: Optional[str] = None,
-) -> List[Tuple[int, str, str]]:
+    tracks: list[Track], station: Station, default_name: str = ""
+) -> list[RipJob]:
     """Interactive series setup. Returns validated rip jobs or an empty list."""
     analysis = analyze_series_tracks(tracks)
     recommended = analysis.recommended_ids
@@ -143,20 +132,20 @@ def prompt_series_jobs(
         if not selection:
             selected_ids = recommended
         elif selection == "*":
-            selected_ids = [track["id"] for track in tracks]
+            selected_ids = [track.id for track in tracks]
         else:
             selected_ids = parse_track_selection(selection)
-        available = {track["id"] for track in tracks}
+        available = {track.id for track in tracks}
         if selected_ids and all(track_id in available for track_id in selected_ids):
             break
         print("Ungültige oder leere Auswahl.")
 
-    by_id = {track["id"]: track for track in tracks}
+    by_id = {track.id: track for track in tracks}
     selected_tracks = [by_id[track_id] for track_id in selected_ids]
     if not selection and recommended:
         selected_tracks = order_episode_tracks(selected_tracks)
 
-    order_default = format_number_ranges(track["id"] for track in selected_tracks)
+    order_default = format_number_ranges(track.id for track in selected_tracks)
     order_value = input(
         f"Reihenfolge [Enter={order_default}, 'r'=umkehren, sonst Track-IDs, q=Abbrechen]: "
     ).strip()
@@ -205,16 +194,13 @@ def prompt_series_jobs(
     if season_number is None:
         return []
 
-    base_dir = base_output_dir or BASE_OUTPUT_DIR
-    inferred_episodes = [extract_episode_info(track)[1] for track in selected_tracks]
-    if not all(number is not None for number in inferred_episodes):
-        episode_start = next_episode_number(
-            raw_name,
-            season_number,
-            base_output_dir=base_dir,
-            reserved_outputs=reserved_outputs,
-            job_state_lock=job_state_lock,
-        )
+    inferred_episodes = [
+        number
+        for number in (extract_episode_info(track)[1] for track in selected_tracks)
+        if number is not None
+    ]
+    if len(inferred_episodes) != len(selected_tracks):
+        episode_start = station.next_episode_number(raw_name, season_number)
         inferred_episodes = list(
             range(episode_start, episode_start + len(selected_tracks))
         )
@@ -242,35 +228,33 @@ def prompt_series_jobs(
         season_number,
         selected_tracks,
         episode_numbers,
-        base_output_dir=base_dir,
+        base_output_dir=station.config.base_output_dir,
     )
 
 
 def prompt_movie_jobs(
-    tracks: List[Dict[str, Any]],
-    default_name: str = "",
-    base_output_dir: Optional[str] = None,
-) -> List[Tuple[int, str, str]]:
+    tracks: list[Track], base_output_dir: str, default_name: str = ""
+) -> list[RipJob]:
     """Let the user confirm the longest movie candidate or choose another one."""
-    longest = max(tracks, key=lambda track: track.get("duration_seconds", 0))
+    longest = max(tracks, key=lambda track: track.duration_seconds)
     analysis = SeriesAnalysis(
-        recommended_ids=[longest["id"]],
+        recommended_ids=[longest.id],
         duplicate_of={},
         confidence="",
-        median_duration_seconds=longest.get("duration_seconds", 0),
+        median_duration_seconds=longest.duration_seconds,
     )
     print("\nGefundene Filmtitel (* längster Titel / Empfehlung):")
     print(render_series_tracks(tracks, analysis))
     while True:
-        value = input(f"Track-ID [Enter={longest['id']}, q=Abbrechen]: ").strip()
+        value = input(f"Track-ID [Enter={longest.id}, q=Abbrechen]: ").strip()
         if value.lower() == "q":
             return []
-        selected_id = longest["id"] if not value else None
+        selected_id = longest.id if not value else None
         if value:
             parsed = parse_track_selection(value)
             if len(parsed) == 1:
                 selected_id = parsed[0]
-        selected = next((track for track in tracks if track["id"] == selected_id), None)
+        selected = next((track for track in tracks if track.id == selected_id), None)
         if selected:
             break
         print("Bitte genau eine vorhandene Track-ID eingeben.")
@@ -291,6 +275,5 @@ def prompt_movie_jobs(
     if not movie_name:
         print("Filmname ist leer oder ungültig. Abbruch.")
         return []
-    base_dir = base_output_dir or BASE_OUTPUT_DIR
-    output = os.path.join(base_dir, movie_name, f"{movie_name}.mkv")
-    return [(selected["id"], output, selected.get("output_filename", ""))]
+    output = os.path.join(base_output_dir, movie_name, f"{movie_name}.mkv")
+    return [RipJob(selected.id, output, selected.output_filename)]

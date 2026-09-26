@@ -1,21 +1,60 @@
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
+import traceback
+from enum import Enum
 from pathlib import Path
-from typing import Any, List, Optional, Set, Tuple
+from typing import IO
 
 from ripstation.analyzer import canonical_output_path
-from ripstation.config import detect_makemkv_cmd, detect_mkvpropedit_cmd
 from ripstation.hardware import drive_source_candidates, eject_drive
-from ripstation.models import Drive
+from ripstation.models import Drive, DriveStatus, RipJob
+from ripstation.process import CREATE_NO_WINDOW, OUTPUT_ENCODING, ensure_process_stopped
+from ripstation.station import Station
 
-job_state_lock = threading.Lock()
-reserved_outputs: Set[str] = set()
+LOG_FILENAME = "rip.log"
 
 
-def parse_progress_line(line: str) -> Optional[int]:
+class JobResult(Enum):
+    DONE = "done"
+    DONE_META_WARN = "done_meta_warn"
+    STOPPED = "stopped"
+
+
+class ProcessStartError(Exception):
+    """MakeMKV could not be launched at all."""
+
+
+class RipLog:
+    """rip.log writer that tags every line with its drive.
+
+    Several drives may rip into the same directory; the file is line-buffered
+    and opened for appending, so their lines interleave but never mix.
+    """
+
+    def __init__(self, handle: IO[str], drive: Drive):
+        self.handle = handle
+        self.prefix = f"[Laufwerk {drive.mkv_id}] "
+
+    def write(self, text: str) -> None:
+        for line in text.splitlines() or [""]:
+            self.handle.write(f"{self.prefix}{line}\n")
+
+
+def open_log(directory: str) -> IO[str]:
+    return open(
+        os.path.join(directory, LOG_FILENAME),
+        "a",
+        encoding="utf-8",
+        errors="replace",
+        buffering=1,
+    )
+
+
+def parse_progress_line(line: str) -> int | None:
     """Return MakeMKV's overall PRGV progress as a percentage."""
     if not line.startswith("PRGV:"):
         return None
@@ -31,20 +70,8 @@ def parse_progress_line(line: str) -> Optional[int]:
         return None
 
 
-def release_output_paths(
-    jobs: List[Tuple[int, str, str]],
-    target_set: Optional[Set[str]] = None,
-    lock: Any = None,
-) -> None:
-    paths = {canonical_output_path(output) for _, output, _ in jobs}
-    lock_to_use = lock or job_state_lock
-    set_to_use = target_set if target_set is not None else reserved_outputs
-    with lock_to_use:
-        set_to_use.difference_update(paths)
-
-
 def find_created_mkv(
-    target_dir: str, source_mkv_filename: str, files_before_rip: Set[Path]
+    target_dir: str, source_mkv_filename: str, files_before_rip: set[Path]
 ) -> str:
     """Find only a regular MKV file created by the current MakeMKV invocation."""
     before = {canonical_output_path(path) for path in files_before_rip}
@@ -84,40 +111,35 @@ def remove_empty_directory(path: str) -> None:
 
 def move_without_overwrite(source: str, destination: str) -> None:
     """Publish a staged file without replacing a destination created meanwhile."""
-    try:
-        if os.name == "nt":
-            # Windows rename fails when the destination already exists.
-            os.rename(source, destination)
-        else:
-            # Staging is inside the destination directory, so both paths share a FS.
-            os.link(source, destination)
-            os.unlink(source)
-    except FileExistsError as error:
-        raise FileExistsError(
-            f"Zieldatei existiert bereits, wird nicht überschrieben: {destination}"
-        ) from error
-
-
-def ensure_process_stopped(proc: Optional[subprocess.Popen], timeout: int = 10) -> None:
-    """Terminate and, if necessary, kill a child that did not exit normally."""
-    if proc is None or getattr(proc, "returncode", None) is not None:
-        return
-    try:
-        if proc.poll() is not None:
-            return
-        proc.terminate()
+    exists_error = FileExistsError(
+        f"Zieldatei existiert bereits, wird nicht überschrieben: {destination}"
+    )
+    if os.name == "nt":
+        # Windows rename fails when the destination already exists.
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    except (OSError, ProcessLookupError):
+            os.rename(source, destination)
+        except FileExistsError as error:
+            raise exists_error from error
         return
 
+    # Staging is inside the destination directory, so both paths share a FS.
+    try:
+        os.link(source, destination)
+    except FileExistsError as error:
+        raise exists_error from error
+    except OSError:
+        # exFAT/FAT, many SMB and some NFS mounts have no hard links. Outputs
+        # are reserved by the station, so only an external writer could race us.
+        if os.path.lexists(destination):
+            raise exists_error from None
+        os.rename(source, destination)
+        return
+    os.unlink(source)
 
-def cancel_drive_rip(drive: Drive) -> bool:
+
+def cancel_drive_rip(station: Station, drive: Drive) -> bool:
     """Request cancellation of an ongoing rip on the given drive."""
-    with job_state_lock:
+    with station.lock:
         if not drive.busy:
             return False
         drive.cancel_requested = True
@@ -127,273 +149,238 @@ def cancel_drive_rip(drive: Drive) -> bool:
     return True
 
 
-def stop_all_workers(drives_list: List[Drive]) -> None:
+def stop_all_workers(station: Station) -> None:
     """Stop all active worker processes (e.g. on SIGINT/shutdown)."""
-    for drive in drives_list:
-        if drive.busy or drive.active_process is not None:
-            cancel_drive_rip(drive)
+    for drive in station.busy_drives():
+        cancel_drive_rip(station, drive)
 
 
-def _rip_jobs_worker(
-    drive: Drive,
-    jobs: List[Tuple[int, str, str]],
-    disc_source: str,
-    makemkv_cmd: Optional[str] = None,
-    mkvpropedit_cmd: Optional[str] = None,
-    auto_eject: bool = True,
-) -> None:
-    makemkv = makemkv_cmd or detect_makemkv_cmd()
-    mkvpropedit = mkvpropedit_cmd or detect_mkvpropedit_cmd()
-
-    drive.status = "Starting..."
-    drive.progress = 0
-    total_jobs = len(jobs)
-    metadata_warning = False
-    first_job_stem = os.path.splitext(
-        os.path.basename(jobs[0][1] if jobs else "Unknown Job")
-    )[0]
-    original_job_name = re.sub(r"(?i)\.S\d+E\d+$", "", first_job_stem)
-
-    for i, (track_id, final_output_path, source_mkv_filename) in enumerate(jobs):
-        if drive.cancel_requested:
-            drive.status = "CANCELLED"
-            break
-
-        job_progress_text = f"({i + 1}/{total_jobs})"
-        drive.status = f"Ripping {job_progress_text}"
-        drive.current_job = os.path.basename(final_output_path)
-        drive.progress = 0
-
-        target_dir = os.path.dirname(final_output_path)
-        os.makedirs(target_dir, exist_ok=True)
-        staging_dir = tempfile.mkdtemp(
-            prefix=f".ripstation-{drive.mkv_id}-{track_id}-",
-            dir=target_dir,
+def run_makemkv(
+    station: Station, drive: Drive, cmd: list[str], log: RipLog
+) -> int | None:
+    """Stream MakeMKV output into the log; returns None if the user cancelled."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding=OUTPUT_ENCODING,
+            errors="replace",
+            bufsize=1,
+            creationflags=CREATE_NO_WINDOW,
         )
-        files_before_rip = {
-            path for path in Path(staging_dir).glob("*.mkv") if path.is_file()
-        }
+    except OSError as error:
+        raise ProcessStartError(str(error)) from error
 
+    try:
+        with station.lock:
+            drive.active_process = proc
+            cancelled = drive.cancel_requested
+        if not cancelled:
+            for line in proc.stdout or []:
+                if drive.cancel_requested:
+                    break
+                log.write(line)
+                progress = parse_progress_line(line)
+                if progress is not None:
+                    drive.progress = progress
+        if drive.cancel_requested:
+            return None
+        return proc.wait()
+    finally:
+        with station.lock:
+            drive.active_process = None
+        ensure_process_stopped(proc)
+
+
+def publish_output(staging_dir: str, job: RipJob, files_before: set[Path]) -> None:
+    created_file = find_created_mkv(staging_dir, job.source_filename, files_before)
+    move_without_overwrite(created_file, job.output_path)
+
+
+def set_title(mkvpropedit_cmd: str, path: str, log: RipLog) -> bool:
+    """Set the MKV title to the file name; returns False on a (non-fatal) failure."""
+    title = os.path.splitext(os.path.basename(path))[0]
+    try:
+        result = subprocess.run(
+            [mkvpropedit_cmd, path, "--edit", "info", "--set", f"title={title}"],
+            capture_output=True,
+            encoding=OUTPUT_ENCODING,
+            errors="replace",
+            timeout=120,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log.write(f"WARNUNG: mkvpropedit nicht verfügbar oder Timeout: {error}")
+        return False
+    if result.returncode != 0:
+        log.write(f"WARNUNG: mkvpropedit: {result.stderr.strip()}")
+        return False
+    return True
+
+
+def rip_single_job(
+    station: Station, drive: Drive, job: RipJob, disc_source: str, log: RipLog
+) -> JobResult:
+    """Rip one title into a private staging directory and publish it."""
+    log.write(
+        f"--- Starte Auftrag ({drive.job_step}): Track {job.track_id} "
+        f"-> {job.output_path} ---"
+    )
+    staging_dir = tempfile.mkdtemp(
+        prefix=f".ripstation-{drive.mkv_id}-{job.track_id}-",
+        dir=os.path.dirname(job.output_path),
+    )
+    try:
+        files_before = {p for p in Path(staging_dir).glob("*.mkv") if p.is_file()}
         cmd = [
-            makemkv,
+            station.config.makemkv_cmd,
             "-r",
             "--progress=-same",
             "mkv",
             disc_source,
-            str(track_id),
+            str(job.track_id),
             staging_dir,
         ]
+        try:
+            exit_code = run_makemkv(station, drive, cmd, log)
+        except ProcessStartError as error:
+            log.write(f"FEHLER: MakeMKV konnte nicht gestartet werden: {error}")
+            drive.status = DriveStatus.ERROR_START
+            drive.message = "MakeMKV nicht startbar (siehe rip.log)"
+            return JobResult.STOPPED
 
-        log_file = os.path.join(os.path.dirname(jobs[0][1]), "rip.log")
-        creation_flags = 0x08000000 if os.name == "nt" else 0
+        if exit_code is None:
+            log.write("WARNUNG: Vorgang wurde durch Benutzer abgebrochen.")
+            return JobResult.STOPPED
 
-        with open(log_file, "a", encoding="utf-8", errors="replace") as f:
-            f.write(
-                f"\n--- Starting Job {job_progress_text}: Rip Track {track_id} ---\n"
-            )
-            proc: Optional[subprocess.Popen] = None
-            try:
-                try:
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        creationflags=creation_flags,
-                    )
-                    with job_state_lock:
-                        drive.active_process = proc
-                        cancelled = drive.cancel_requested
-                    if cancelled:
-                        ensure_process_stopped(proc)
-                except OSError as error:
-                    f.write(f"ERROR: MakeMKV konnte nicht gestartet werden: {error}\n")
-                    drive.status = "ERROR (Start)"
-                    remove_empty_directory(staging_dir)
-                    break
-
-                for line in proc.stdout:  # type: ignore
-                    if drive.cancel_requested:
-                        ensure_process_stopped(proc)
-                        break
-                    f.write(line)
-                    progress = parse_progress_line(line)
-                    if progress is not None:
-                        drive.progress = progress
-
-                proc.wait()
-            finally:
-                with job_state_lock:
-                    drive.active_process = None
-                ensure_process_stopped(proc)
-                remove_empty_directory(staging_dir)
-
-            if drive.cancel_requested:
-                drive.status = "CANCELLED"
-                f.write("WARNUNG: Vorgang wurde durch Benutzer abgebrochen.\n")
-                remove_empty_directory(staging_dir)
-                break
-
-            drive.status = f"Processing {job_progress_text}"
-
-            if proc.returncode == 0:
-                try:
-                    created_file = find_created_mkv(
-                        staging_dir, source_mkv_filename, files_before_rip
-                    )
-
-                    move_without_overwrite(created_file, final_output_path)
-
-                    # Metadata title (via mkvpropedit)
-                    try:
-                        meta_result = subprocess.run(
-                            [
-                                mkvpropedit,
-                                final_output_path,
-                                "--edit",
-                                "info",
-                                "--set",
-                                f"title={os.path.splitext(os.path.basename(final_output_path))[0]}",
-                            ],
-                            capture_output=True,
-                            text=True,
-                            timeout=120,
-                            creationflags=creation_flags,
-                        )
-                        if meta_result.returncode != 0:
-                            metadata_warning = True
-                            f.write(
-                                f"WARNING: mkvpropedit: {meta_result.stderr.strip()}\n"
-                            )
-                    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-                        metadata_warning = True
-                        f.write(
-                            f"WARNING: mkvpropedit nicht verfügbar oder Timeout: {error}\n"
-                        )
-                except Exception as e:
-                    f.write(f"ERROR: {e}\n")
-                    drive.status = "ERROR (Post)"
-                    remove_empty_directory(staging_dir)
-                    break
+        if exit_code != 0:
+            drive.status = DriveStatus.ERROR_RIP
+            if any(Path(staging_dir).iterdir()):
+                log.write(f"Unvollständige Dateien verbleiben in: {staging_dir}")
+                drive.message = f"Teildateien in {staging_dir}"
             else:
-                drive.status = "ERROR (Rip)"
-                if Path(staging_dir).exists():
-                    f.write(f"Unvollständige Dateien verbleiben in: {staging_dir}\n")
-                else:
-                    f.write(
-                        "MakeMKV wurde mit einem Fehler beendet; "
-                        "keine Teildatei vorhanden.\n"
-                    )
-                remove_empty_directory(staging_dir)
-                break
+                log.write(
+                    "MakeMKV wurde mit einem Fehler beendet; keine Teildatei vorhanden."
+                )
+            return JobResult.STOPPED
 
-        remove_empty_directory(staging_dir)
+        drive.status = DriveStatus.PROCESSING
+        try:
+            publish_output(staging_dir, job, files_before)
+        except OSError as error:
+            log.write(f"FEHLER: {error}")
+            drive.status = DriveStatus.ERROR_POST
+            drive.message = str(error)
+            return JobResult.STOPPED
 
-    if drive.cancel_requested:
-        drive.status = "CANCELLED"
-    elif not drive.status.startswith("ERROR"):
-        final_status = "COMPLETED (META WARN)" if metadata_warning else "COMPLETED"
-        drive.current_job = original_job_name
+        if set_title(station.config.mkvpropedit_cmd, job.output_path, log):
+            return JobResult.DONE
+        return JobResult.DONE_META_WARN
+    finally:
+        if drive.cancel_requested:
+            # A cancelled rip is never resumed; drop the partial file.
+            shutil.rmtree(staging_dir, ignore_errors=True)
+        else:
+            remove_empty_directory(staging_dir)
+
+
+def _rip_jobs_worker(
+    station: Station, drive: Drive, jobs: list[RipJob], disc_source: str
+) -> None:
+    drive.status = DriveStatus.STARTING
+    drive.progress = 0
+    metadata_warning = False
+    first_job_stem = os.path.splitext(
+        os.path.basename(jobs[0].output_path if jobs else "Unknown Job")
+    )[0]
+    original_job_name = re.sub(r"(?i)\.S\d+E\d+$", "", first_job_stem)
+
+    for index, job in enumerate(jobs, 1):
+        if drive.cancel_requested:
+            break
+
+        drive.job_step = f"{index}/{len(jobs)}"
+        drive.status = DriveStatus.RIPPING
+        drive.current_job = os.path.basename(job.output_path)
         drive.progress = 0
-        if auto_eject:
-            drive.status = "Ejecting..."
-            eject_drive(drive.device_path)
-        drive.status = final_status
+
+        target_dir = os.path.dirname(job.output_path)
+        os.makedirs(target_dir, exist_ok=True)
+        with open_log(target_dir) as handle:
+            result = rip_single_job(
+                station, drive, job, disc_source, RipLog(handle, drive)
+            )
+        if result is JobResult.STOPPED:
+            break
+        if result is JobResult.DONE_META_WARN:
+            metadata_warning = True
 
     drive.progress = 0
+    drive.job_step = ""
+    if drive.cancel_requested:
+        drive.status = DriveStatus.CANCELLED
+    elif not drive.status.is_error:
+        drive.current_job = original_job_name
+        if station.config.auto_eject:
+            drive.status = DriveStatus.EJECTING
+            eject_error = eject_drive(drive.device_path)
+            if eject_error:
+                drive.message = eject_error
+        drive.status = (
+            DriveStatus.COMPLETED_META_WARN
+            if metadata_warning
+            else DriveStatus.COMPLETED
+        )
 
 
 def rip_jobs_worker(
+    station: Station,
     drive: Drive,
-    jobs: List[Tuple[int, str, str]],
-    disc_source: Optional[str] = None,
-    owns_job_state: bool = False,
-    makemkv_cmd: Optional[str] = None,
-    mkvpropedit_cmd: Optional[str] = None,
-    auto_eject: bool = True,
+    jobs: list[RipJob],
+    disc_source: str | None = None,
 ) -> None:
     """Keep unexpected filesystem/process errors from leaving a drive busy forever."""
     disc_source = disc_source or drive.media_source or drive_source_candidates(drive)[0]
     try:
-        _rip_jobs_worker(
-            drive,
-            jobs,
-            disc_source,
-            makemkv_cmd=makemkv_cmd,
-            mkvpropedit_cmd=mkvpropedit_cmd,
-            auto_eject=auto_eject,
-        )
+        _rip_jobs_worker(station, drive, jobs, disc_source)
     except Exception as error:
-        drive.status = "ERROR (Worker)"
+        drive.status = DriveStatus.ERROR_WORKER
         drive.progress = 0
-        print(f"Unerwarteter Fehler bei Laufwerk {drive.device_path}: {error}")
+        drive.message = str(error)
+        try:
+            with open_log(os.path.dirname(jobs[0].output_path)) as handle:
+                RipLog(handle, drive).write(
+                    f"FEHLER: Unerwarteter Fehler\n{traceback.format_exc()}"
+                )
+        except (OSError, IndexError):
+            pass
     finally:
-        if owns_job_state:
-            release_output_paths(jobs)
-            with job_state_lock:
-                drive.busy = False
-                drive.active_process = None
+        station.release(drive, jobs)
 
 
 def start_rip_jobs(
-    drive: Drive,
-    jobs: List[Tuple[int, str, str]],
-    makemkv_cmd: Optional[str] = None,
-    mkvpropedit_cmd: Optional[str] = None,
-    auto_eject: bool = True,
-) -> Tuple[Optional[threading.Thread], Optional[str]]:
+    station: Station, drive: Drive, jobs: list[RipJob]
+) -> tuple[threading.Thread | None, str | None]:
     """Atomically reserve a drive and all outputs before starting its worker."""
     if not jobs:
         return None, "Keine Rip-Aufträge vorhanden."
 
-    outputs = [output for _, output, _ in jobs]
-    canonical = [canonical_output_path(output) for output in outputs]
-    with job_state_lock:
-        if drive.busy:
-            return None, f"Laufwerk {drive.mkv_id} ist bereits beschäftigt."
-        duplicate_paths = {path for path in canonical if canonical.count(path) > 1}
-        conflicts = [
-            output
-            for output, normalized in zip(outputs, canonical)
-            if normalized in duplicate_paths
-            or normalized in reserved_outputs
-            or os.path.exists(output)
-        ]
-        if conflicts:
-            return (
-                None,
-                "Zieldatei bereits vorhanden oder reserviert:\n  "
-                + "\n  ".join(conflicts),
-            )
-
-        reserved_outputs.update(canonical)
-        drive.busy = True
-        drive.status = "Starting..."
-        drive.progress = 0
-        drive.cancel_requested = False
-        disc_source = drive.media_source or drive_source_candidates(drive)[0]
+    error_message = station.reserve(drive, jobs)
+    if error_message:
+        return None, error_message
+    # Fixed for the whole job, even if a rescan updates the drive meanwhile.
+    disc_source = drive.media_source or drive_source_candidates(drive)[0]
 
     try:
         thread = threading.Thread(
             target=rip_jobs_worker,
-            args=(
-                drive,
-                jobs,
-                disc_source,
-                True,
-                makemkv_cmd,
-                mkvpropedit_cmd,
-                auto_eject,
-            ),
+            args=(station, drive, jobs, disc_source),
             name=f"rip-{drive.device_path}",
         )
         thread.start()
     except Exception as error:
-        release_output_paths(jobs)
-        with job_state_lock:
-            drive.busy = False
-            drive.status = "ERROR (Start)"
-            drive.active_process = None
+        station.release(drive, jobs)
+        drive.status = DriveStatus.ERROR_START
         return None, f"Worker konnte nicht gestartet werden: {error}"
     return thread, None
